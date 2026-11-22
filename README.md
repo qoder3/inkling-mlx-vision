@@ -18,10 +18,15 @@ Adds full multimodal image input (`image_url` / base64 screenshots), zero-overhe
   - Injects deterministic image-hash surrogate IDs into cache keys: follow-up turns on the same screenshot skip ViT completely (`0 ms`), while two different images of identical resolution never collide.
   - **Dynamic preamble pinning:** automatically detects shared `system` + `tools` + leading `<system-reminder>` blocks (~24K tokens in agent IDEs) and pins a snapshot so new chats start in ~1–2s instead of ~60s; refreshes automatically when memory/MCP tools/date change.
   - High text `min_tokens` (default `2048`) prevents short auto-title requests from evicting active coding chats.
+- **Custom Apple Silicon Metal Kernels & 16+ Core M4 Pro/Max Accelerations (`accel.py`)** — 100% mathematically equivalent (`rmse <= 6e-7` vs stock) runtime drop-ins requiring zero edits to `lookatmyquant`:
+  - **GQA-Shared Split-K `simdgroup_half8x8` SDPA (`T=2..8`)** for DSpark block & speculative tree verify: 3 GQA heads share one `BK=32` K/V tile load via hardware `simdgroup_multiply_accumulate` — **4.47×–5.46× faster** at 32K–64K context (`84 ms` saved per tree verification step across 8 global visits).
+  - **Lean-SRAM GQA-Shared FlashAttention-2 (`BQ=32, BK=32`, 15.6 KB SRAM)** for long-context prefill: **1.38×–1.54× faster** than stock FlashAttention-2 at 32K–64K context.
+  - **16+ Core M4 Pro/Max Grid Tuning (`applegpu_g16s/c/d`):** removes base 10-core M4 `ntg=10/20/30/60` throttling across `DenseStage` (1.20×–1.90×), `UnifiedMoESide` (1.17×–1.76×), and `T=1` Split-K SDPA (`48` splits).
+  - **O(N) Global KV Allocation + Zero-Copy Chat Extension:** replaces quadratic `+256` reallocations in `Inkling2Cache` and `DSparkDrafterMLX` with `4096`-step pre-reservation (`_reserve_cap`) and moves non-pinned chat snapshots in-place before extending, cutting KV copy traffic and peak RAM spikes in half.
 - **Agent-IDE Server Stability (`queue.py`, `parser.py`, `server.py`)**
   - **Fair FIFO queue** instead of `HTTP 503 model is busy` + **continuous SSE keepalive** (`: queued` / `: prefilling` / `: generating`) on any pause `>= 5s`, preventing client idle timeouts during long tool calls.
-  - **24 GB Unified Memory safety:** `LAMQ_GLOBAL_KV=fp8`, bounded Metal buffer cache (`--metal-cache-mb 256`), chunked prefill (`--prefill-chunk 256`), and `64 MiB` request body limit for 128K contexts + base64 screenshots.
-  - **Live token/state monitoring & loop guard:** logs parser state (`thinking`, `text`, `tool(name, buf=...)`, `discard_tool`) every 2s and cleanly stops verbatim 256-token repetition loops or stuck `discard_tool` runs.
+  - **24 GB Unified Memory safety:** `LAMQ_GLOBAL_KV=fp8` (or `LAMQ_GLOBAL_KV=q4` for ultra-low KV footprint at 64K–128K), bounded Metal buffer cache (`--metal-cache-mb 256`), chunked prefill (`--prefill-chunk 256`), and `64 MiB` request body limit for 128K contexts + base64 screenshots.
+  - **Live token/state monitoring, FP8 tool-JSON typo auto-repair & loop guard:** logs accurate generation `tok/s` and parser state (`thinking`, `text`, `tool(name, buf=...)`, `discard_tool`), auto-repairs quantized Inkling-2 tool JSON missing `,"` before `args`/`arguments`, and cleanly stops verbatim 256-token repetition loops or stuck `discard_tool` runs.
   - **SSRF protection:** remote `http(s)://` image URLs are disabled by default (`--allow-remote-images` enables them with private/loopback/link-local IP blocking); `file://` URLs are only allowed on loopback hosts.
 
 ---
@@ -88,8 +93,24 @@ Measured with `Inkling-2-Mini-LookAtMyQuant-8.9GB` + 4-bit DSpark drafter + `LAM
 | Vision encoding (`1280×800`, 640 tok) | 571 ms | 9.27 GB / 10.87 GB peak |
 | Vision encoding (`1920×1080`, 1,296 tok) | 1.15 s | +11.9 MB embeddings |
 | Follow-up turn on cached image | **0 ms ViT**, 0.3s prefill | 9.27 GB |
-| Prefill (`chunk=256`, 24K–32K ctx) | 260–330 tok/s | 10.8–12.9 GB peak |
-| Decode (with 4-bit DSpark drafter) | **24–45 tok/s** | 11–12 GB |
+| Prefill (`chunk=256`, 24K–32K ctx) | 260–330 tok/s (stock) + 1.38×–1.54× custom FA2 + O(N) KV | 10.8–12.9 GB peak |
+| Decode (with 4-bit DSpark drafter) | **24–45+ tok/s** (4.47×–5.46× faster global verify SDPA at 32K–64K) | 11–12 GB |
+
+### Custom Metal Kernel Benchmarks (16-Core Apple M4 Pro, Global Attention Visit)
+
+| Kernel / Workload | Stock `lookatmyquant` | `inkling-mlx-vision` (`accel.py`) | Speedup | Parity (`rmse`) |
+|---|---|---|---|---|
+| 32K FP8 `T=8` causal verify SDPA | 7.12 ms | **1.52 ms** | **4.68×** | `6.1e-7` |
+| 32K FP8 `T=8` tree(`4-3`) verify SDPA | 8.21 ms | **1.50 ms** | **5.46×** | `6.1e-7` |
+| 64K FP8 `T=8` causal verify SDPA | 12.05 ms | **2.70 ms** | **4.47×** | `4.3e-7` |
+| 64K FP8 `T=8` tree(`4-3`) verify SDPA | 13.25 ms | **2.72 ms** | **4.86×** | `4.3e-7` |
+| 64K FP8 `T=256` prefill FA2 | 73.81 ms | **48.07 ms** | **1.54×** | `2.7e-8` |
+| 64K Q4 `T=8` causal verify SDPA | 13.13 ms | **2.97 ms** | **4.43×** | `4.3e-7` |
+| 64K Q4 `T=256` prefill FA2 | 72.38 ms | **49.54 ms** | **1.46×** | `2.7e-8` |
+| `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
+| `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
+| `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
+| 32K Global KV reallocation copies | 4.74 s (`+256` step) | **0.04 s** (pre-reserved) | **118×** | bit-exact |
 
 ### Memory Budget for 128K Context (`LAMQ_GLOBAL_KV=fp8`)
 
@@ -168,6 +189,7 @@ All standard `lamq serve` flags are supported alongside these wrapper options:
 | `--cache-min-tokens INT` | `2048` | Minimum text prompt length to cache (short titles bypass cache) |
 | `--pin-min-tokens INT` | `4096` | Minimum shared preamble length to pin in `SmartPromptCache` |
 | `--no-loop-guard` | `false` | Disable verbatim repetition-loop & stuck `discard_tool` guards |
+| `--no-metal-accel` | `false` | Disable custom Metal SDPA kernels, O(N) KV growth, and M4 Pro grid tuning |
 | `--log-file PATH` | `None` (stderr only) | Also append timestamped logs to a file |
 
 ---

@@ -10,11 +10,15 @@ from runtime_mlx.inkling import generate as _gen
 
 
 class _DummyCache:
+    clone_count: int = 0
+
     def __init__(self, seq_len: int = 0):
         self.seq_len = seq_len
         self.state = []
+        self._reserve_cap = 0
 
     def clone(self):
+        _DummyCache.clone_count += 1
         return _DummyCache(self.seq_len)
 
 
@@ -118,3 +122,21 @@ def test_smart_prompt_cache_vision_hit_miss_and_dynamic_pin(monkeypatch):
     assert reused4 == 0
     pinned = [e for e in pc._entries if e.get("pinned")]
     assert len(pinned) == 1 and pinned[0]["tokens"] == pre_v2
+
+    # Turn 2 of Chat 3 extends non-pinned chat -> should move in-place (only 1 clone at _store, not 2!)
+    _DummyCache.clone_count = 0
+    reserves_seen: list[int] = []
+
+    def spy_prefill(m, prompt_ids, cache, *, ordered, prefill_chunk, tap_visits=(), drafter=None, pos0=0, output_head=True):
+        reserves_seen.append(int(getattr(cache, "_reserve_cap", 0)))
+        cache.seq_len += len(prompt_ids)
+        return 0, cache, None, pos0
+
+    monkeypatch.setattr(_gen, "_prefill", spy_prefill)
+    ids5 = ids4 + list(range(700, 720))
+    m._vision_ctx = {"cache_ids": ids5, "images_plan": [], "pin_hint": 35, "weights_path": "x", "encoded_spans": None}
+    _, out_cache, _, _, reused5 = pc.prefill(m, ids5, ordered=False, prefill_chunk=256)
+    assert reused5 == len(ids4) - 1
+    assert _DummyCache.clone_count == 1  # zero-copy move on HIT + 1 clone at _store!
+    assert reserves_seen[0] == len(ids5) + 512
+    assert out_cache._reserve_cap == 0  # cleanly reset in finally

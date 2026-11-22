@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inkling-mlx-vision"
-version = "0.1.0"
-description = "Native MLX Vision Tower + Agent-IDE optimized OpenAI server wrapper for LookAtMyQuant Inkling-2-Mini on Apple Silicon"
+version = "0.2.0"
+description = "Native MLX Vision Tower, custom Metal SDPA/M4-Pro kernels, and Agent-IDE OpenAI server for LookAtMyQuant Inkling-2-Mini"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "qoder3", email = "4l2io7yqj@mozmail.com" }]

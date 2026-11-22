@@ -169,23 +169,7 @@ class SmartPromptCache(_gen.PromptCache):
             self._owner = owner
 
         hit = self._match(key_ids, drafting)
-        if hit is not None:
-            self._clock += 1
-            hit["used"] = self._clock
-            cache = hit["cache"].clone()
-            if drafting:
-                drafter.restore_context(hit["drafter"])
-            start = len(hit["tokens"])
-            kind = "pinned-sys" if hit.get("pinned") else "chat"
-            self.log_fn(f"[cache] HIT {start}/{n} tok ({kind}, new {n - start} tok)")
-        else:
-            cache = m.make_cache()
-            if drafting:
-                drafter.reset()
-            start = 0
-            self.log_fn(f"[cache] MISS 0/{n} tok (entries={len(self._entries)}/{self.max_entries})")
-
-        ensure_vision_encoded(m, start, self.log_fn)
+        start = len(hit["tokens"]) if hit is not None else 0
 
         pin_pos: int | None = None
         first_img_pos = vctx["images_plan"][0][0] if has_images else n
@@ -205,52 +189,100 @@ class SmartPromptCache(_gen.PromptCache):
             ):
                 pin_pos = u
 
-        if pin_pos is not None:
-            _, cache, taps, taps_start = _gen._prefill(
+        if hit is not None:
+            self._clock += 1
+            hit["used"] = self._clock
+            kind = "pinned-sys" if hit.get("pinned") else "chat"
+            move_hit = not hit.get("pinned") and start < n - 1 and pin_pos is None and (n - 1) >= eff_min
+            if move_hit:
+                # Transfer ownership in-place (this chat snapshot is about to be superseded at n - 1),
+                # cutting KV copy traffic and peak RAM in half while keeping _entries clean on abort.
+                self._entries = [e for e in self._entries if e is not hit]
+                cache = hit["cache"]
+                if drafting:
+                    st = hit["drafter"]
+                    if st is not None and hasattr(drafter, "ctx_k") and isinstance(st, dict) and "ctx_k" in st:
+                        drafter.ctx_k = list(st["ctx_k"])
+                        drafter.ctx_v = list(st["ctx_v"])
+                        drafter._ctx_cur = list(st["_ctx_cur"])
+                        drafter._ctx_cap = list(st["_ctx_cap"])
+                        drafter.ctx_len = st["ctx_len"]
+                        drafter.f_rnn = st["f_rnn"]
+                    else:
+                        drafter.restore_context(st)
+                self.log_fn(f"[cache] HIT {start}/{n} tok ({kind}, in-place +{n - start} tok)")
+            else:
+                cache = hit["cache"].clone()
+                if drafting:
+                    drafter.restore_context(hit["drafter"])
+                self.log_fn(f"[cache] HIT {start}/{n} tok ({kind}, new {n - start} tok)")
+        else:
+            cache = m.make_cache()
+            if drafting:
+                drafter.reset()
+            self.log_fn(f"[cache] MISS 0/{n} tok (entries={len(self._entries)}/{self.max_entries})")
+
+        ensure_vision_encoded(m, start, self.log_fn)
+
+        try:
+            if pin_pos is not None:
+                # Size tightly to pin_pos so the pinned snapshot holds no unused tail capacity.
+                cache._reserve_cap = pin_pos
+                if drafting:
+                    drafter._reserve_cap = pin_pos
+                _, cache, taps, taps_start = _gen._prefill(
+                    m,
+                    ids[start:pin_pos],
+                    cache,
+                    ordered=False,
+                    prefill_chunk=prefill_chunk,
+                    tap_visits=tap_visits,
+                    drafter=drafter,
+                    pos0=start,
+                    output_head=False,
+                )
+                if drafting:
+                    drafter.push_context(taps, start_pos=taps_start)
+                self._store(key_ids[:pin_pos], cache, drafter, pinned=True)
+                self.log_fn(
+                    f"[cache] pinned shared system/tools prefix ({pin_pos} tok) | "
+                    f"active {mx.get_active_memory() / 1e9:.2f} GB"
+                )
+                start = pin_pos
+
+            if start < n - 1:
+                # Pre-reserve full prompt + decode headroom in one allocation (eliminates O(N^2) KV copies).
+                cache._reserve_cap = n + 512
+                if drafting:
+                    drafter._reserve_cap = n + 512
+                _, cache, taps, taps_start = _gen._prefill(
+                    m,
+                    ids[start : n - 1],
+                    cache,
+                    ordered=False,
+                    prefill_chunk=prefill_chunk,
+                    tap_visits=tap_visits,
+                    drafter=drafter,
+                    pos0=start,
+                    output_head=False,
+                )
+                if drafting:
+                    drafter.push_context(taps, start_pos=taps_start)
+                self._store(key_ids[: n - 1], cache, drafter, pinned=False, min_tok=eff_min)
+                start = n - 1
+
+            out, cache, taps, taps_start = _gen._prefill(
                 m,
-                ids[start:pin_pos],
+                ids[start:],
                 cache,
-                ordered=False,
+                ordered=ordered,
                 prefill_chunk=prefill_chunk,
                 tap_visits=tap_visits,
                 drafter=drafter,
                 pos0=start,
-                output_head=False,
             )
+        finally:
+            cache._reserve_cap = 0
             if drafting:
-                drafter.push_context(taps, start_pos=taps_start)
-            self._store(key_ids[:pin_pos], cache, drafter, pinned=True)
-            self.log_fn(
-                f"[cache] pinned shared system/tools prefix ({pin_pos} tok) | "
-                f"active {mx.get_active_memory() / 1e9:.2f} GB"
-            )
-            start = pin_pos
-
-        if start < n - 1:
-            _, cache, taps, taps_start = _gen._prefill(
-                m,
-                ids[start : n - 1],
-                cache,
-                ordered=False,
-                prefill_chunk=prefill_chunk,
-                tap_visits=tap_visits,
-                drafter=drafter,
-                pos0=start,
-                output_head=False,
-            )
-            if drafting:
-                drafter.push_context(taps, start_pos=taps_start)
-            self._store(key_ids[: n - 1], cache, drafter, pinned=False, min_tok=eff_min)
-            start = n - 1
-
-        out, cache, taps, taps_start = _gen._prefill(
-            m,
-            ids[start:],
-            cache,
-            ordered=ordered,
-            prefill_chunk=prefill_chunk,
-            tap_visits=tap_visits,
-            drafter=drafter,
-            pos0=start,
-        )
+                drafter._reserve_cap = 0
         return out, cache, taps, taps_start, (len(hit["tokens"]) if hit is not None else 0)

@@ -1,19 +1,28 @@
-"""Monitored OutputParser with live token/state logging and runaway repetition-loop guards."""
+"""Monitored OutputParser with live token/state logging, FP8 tool-JSON typo repair, and runaway loop guards."""
 
 from __future__ import annotations
 
 import collections
+import json
+import re
 import time
+import uuid
 from typing import Callable
 
 import mlx.core as mx
 from runtime_mlx import server as _server
 
 _OrigOutputParser = _server.OutputParser
+_TOOL_JSON_TYPO_RE = re.compile(r'^(\s*\{\s*"name"\s*:\s*"[^"]+")\s*,?\s*"?(args|arguments)"\s*:')
+
+
+def repair_tool_json(raw: str) -> str:
+    """Repair Inkling-2 quantized tool JSON missing `,"` before `args`/`arguments`."""
+    return _TOOL_JSON_TYPO_RE.sub(r'\1,"\2":', raw, count=1)
 
 
 class MonitoredOutputParser(_OrigOutputParser):
-    """Extends `lamq serve`'s `OutputParser` with visibility during tool buffering and stuck-loop protection."""
+    """Extends `lamq serve`'s `OutputParser` with live visibility, FP8 tool-JSON repair, and loop protection."""
 
     loop_guard_enabled: bool = True
     max_discard_tool_tokens: int = 1024
@@ -26,12 +35,59 @@ class MonitoredOutputParser(_OrigOutputParser):
 
     def __init__(self, tokenizer, ids: dict[str, int], tool_names=()):
         super().__init__(tokenizer, ids, tool_names)
-        now = time.perf_counter()
-        self._gen_t0 = now
-        self._last_log = now
+        # Start timer lazily on first generated token so prefill time never skews live tok/s.
+        self._gen_t0: float | None = None
+        self._last_log: float | None = None
         self._n_tok = 0
         self._discard_toks = 0
         self._recent: collections.deque[int] = collections.deque(maxlen=self.loop_window)
+
+    def _finish_tool(self, out: list) -> None:
+        raw = self._dec(self.tool_tokens)
+        repaired = False
+        try:
+            obj = json.loads(raw, parse_constant=_server._reject_json_constant)
+        except ValueError:
+            fixed = repair_tool_json(raw)
+            if fixed == raw:
+                return
+            try:
+                obj = json.loads(fixed, parse_constant=_server._reject_json_constant)
+                repaired = True
+            except (ValueError, RecursionError):
+                return
+        except RecursionError:
+            return
+        try:
+            if not isinstance(obj, dict):
+                return
+            name = self.tool_name
+            if not name or ("name" in obj and ("args" in obj or "arguments" in obj)):
+                name = obj.get("name")
+                if self.tool_name and name != self.tool_name:
+                    return
+                args = obj.get("args", obj.get("arguments"))
+            else:
+                args = obj.get("arguments", obj)
+            if not isinstance(name, str) or name not in self.tool_names or not isinstance(args, dict):
+                return
+            arguments = json.dumps(args, ensure_ascii=False, allow_nan=False)
+            arguments.encode("utf-8")
+        except (ValueError, RecursionError):
+            return
+        if repaired:
+            self.log_fn(f"[gen] repaired tool JSON typo for {name!r}")
+        out.append(
+            (
+                "tool",
+                {
+                    "id": "call_" + uuid.uuid4().hex[:24],
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                },
+            )
+        )
+        self.done, self.finish = True, "tool_calls"
 
     def detect_loop(self) -> tuple[int, int] | None:
         """Return `(period, reps)` if trailing tokens repeat verbatim for `>= loop_min_span` tokens."""
@@ -55,6 +111,11 @@ class MonitoredOutputParser(_OrigOutputParser):
         return None
 
     def feed(self, t: int) -> list:
+        now = time.perf_counter()
+        if self._gen_t0 is None:
+            self._gen_t0 = now
+            self._last_log = now
+
         out = super().feed(t)
         self._n_tok += 1
         self._recent.append(t)
@@ -85,8 +146,7 @@ class MonitoredOutputParser(_OrigOutputParser):
                     self.done = True
                     return out
 
-        now = time.perf_counter()
-        if not self.done and now - self._last_log >= self.log_interval_s:
+        if not self.done and self._last_log is not None and now - self._last_log >= self.log_interval_s:
             dt = max(now - self._gen_t0, 1e-9)
             st_desc = self.state
             if self.state == "tool":

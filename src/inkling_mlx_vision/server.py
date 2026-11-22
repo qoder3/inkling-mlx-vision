@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import accel as _accel_mod
 from . import cache as _cache_mod
 from . import parser as _parser_mod
 from . import queue as _queue_mod
@@ -28,6 +29,7 @@ class ServerConfig:
     cache_min_tokens: int = 2048
     pin_min_tokens: int = 4096
     loop_guard: bool = True
+    metal_accel: bool = True
     log_file: Path | None = None
 
 
@@ -212,6 +214,9 @@ def parse_extra_args(argv: list[str]) -> tuple[ServerConfig, list[str]]:
         elif a == "--no-loop-guard":
             cfg.loop_guard = False
             i += 1
+        elif a == "--no-metal-accel":
+            cfg.metal_accel = False
+            i += 1
         elif a == "--log-file" or a.startswith("--log-file="):
             cfg.log_file = Path(take_val("--log-file")).expanduser()
         else:
@@ -238,6 +243,9 @@ def install_patches(cfg: ServerConfig) -> None:
 
     log_fn = _Logger(cfg.log_file)
     _server.log = log_fn
+
+    if cfg.metal_accel:
+        _accel_mod.install_metal_accelerations(log_fn=log_fn)
 
     _cache_mod.SmartPromptCache.default_min_tokens = cfg.cache_min_tokens
     _cache_mod.SmartPromptCache.pin_min_tokens = cfg.pin_min_tokens
