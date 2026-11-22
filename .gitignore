@@ -1,0 +1,20 @@
+# Model weights & artifacts (never commit weights)
+*.safetensors
+*.npz
+*.bin
+*.gguf
+
+# Python / virtualenv / caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs & OS files
+*.log
+.DS_Store
