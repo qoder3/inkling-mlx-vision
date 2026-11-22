@@ -1,41 +1,92 @@
 # inkling-mlx-vision
 
-**Native MLX Vision Tower + Agent-IDE hardened OpenAI server wrapper for [LookAtMyQuant](https://github.com/ShinMegamiBoson/lookatmyquant) `Inkling-2-Mini` on Apple Silicon.**
+**Cloud-tier coding & vision intelligence (`79.2%` SWE-bench Verified) — running 100% locally on a 16–24 GB MacBook in `8.83 GB` RAM.**
 
-Adds full multimodal image input (`image_url` / base64 screenshots), zero-overhead lazy vision loading, multi-chat queueing, dynamic preamble prefix pinning, and long-context stability for 16–24+ GB Macs running coding agents (ZCode, Cline, Continue, Pi, OpenAI SDK).
+`inkling-mlx-vision` turns [LookAtMyQuant](https://github.com/ShinMegamiBoson/lookatmyquant)'s ultra-compressed **Inkling-2-Mini** into a **fast, multimodal, 128K-context OpenAI server** for local AI coding agents (**ZCode, Cline, Continue, Pi, OpenAI SDK**) on Apple Silicon.
+
+Zero PyTorch. Zero edits to `lookatmyquant`. 100% lossless custom Apple Silicon Metal kernels (`rmse ≤ 6.1e-7`).
 
 ---
 
-## Key Features
+## Why This Matters: Near-Frontier Cloud Quality, Running Locally
 
-- **Native Pure-MLX Vision Tower (`vision.py`)** — Implements Hugging Face `Inkling2ImageProcessor` + `Inkling2VisionModel` line-for-line in pure MLX + NumPy + Pillow (no PyTorch or torchvision required):
-  - RGBA 8×8 checkerboard compositing, `-1.0` bottom-right padding to `40×40` patches, aspect-preserving downscaling for 4K/Retina screenshots (`1920×1080` kept 1:1).
-  - 23-layer BF16 ViT with bilinear `32×32` position embedding interpolation, per-image CLS token, axial 2D `[w, h]` pairwise RoPE, LayerScale, exact erf-GELU, and `2×2` spatial merger (`4096 → 4096 → 2304`).
-  - **0.00 GB RAM overhead on text turns:** `vision_tower.safetensors` (~637 MB) is memory-mapped on demand (~21 ms) and released immediately after encoding before LLM prefill starts.
-  - Supports multiple images per message and images returned inside `role: "tool"` messages.
-- **Zero-Bloat Vision Weight Extractor (`inkling-extract-vision`)** — Extracts the 422 BF16 `vision_tower.*` tensors (~637 MB) directly from Hugging Face using **HTTP Range requests** without downloading the full 16.9 GB checkpoint (or extracts in `<0.5s` from a local checkpoint).
-- **Vision-Safe `SmartPromptCache` (`cache.py`)**
-  - Injects deterministic image-hash surrogate IDs into cache keys: follow-up turns on the same screenshot skip ViT completely (`0 ms`), while two different images of identical resolution never collide.
-  - **Dynamic preamble pinning:** automatically detects shared `system` + `tools` + leading `<system-reminder>` blocks (~24K tokens in agent IDEs) and pins a snapshot so new chats start in ~1–2s instead of ~60s; refreshes automatically when memory/MCP tools/date change.
-  - High text `min_tokens` (default `2048`) prevents short auto-title requests from evicting active coding chats.
-- **Custom Apple Silicon Metal Kernels & 16+ Core M4 Pro/Max Accelerations (`accel.py`)** — 100% mathematically equivalent (`rmse <= 6e-7` vs stock) runtime drop-ins requiring zero edits to `lookatmyquant`:
-  - **GQA-Shared Split-K `simdgroup_half8x8` SDPA (`T=2..8`)** for DSpark block & speculative tree verify: 3 GQA heads share one `BK=32` K/V tile load via hardware `simdgroup_multiply_accumulate` — **4.47×–5.46× faster** at 32K–64K context (`84 ms` saved per tree verification step across 8 global visits).
-  - **Lean-SRAM GQA-Shared FlashAttention-2 (`BQ=32, BK=32`, 15.6 KB SRAM)** for long-context prefill: **1.38×–1.54× faster** than stock FlashAttention-2 at 32K–64K context.
-  - **16+ Core M4 Pro/Max Grid Tuning (`applegpu_g16s/c/d`):** removes base 10-core M4 `ntg=10/20/30/60` throttling across `DenseStage` (1.20×–1.90×), `UnifiedMoESide` (1.17×–1.76×), and `T=1` Split-K SDPA (`48` splits).
-  - **O(N) Global KV Allocation + Zero-Copy Chat Extension:** replaces quadratic `+256` reallocations in `Inkling2Cache` and `DSparkDrafterMLX` with `4096`-step pre-reservation (`_reserve_cap`) and moves non-pinned chat snapshots in-place before extending, cutting KV copy traffic and peak RAM spikes in half.
-- **Agent-IDE Server Stability (`queue.py`, `parser.py`, `server.py`)**
-  - **Fair FIFO queue** instead of `HTTP 503 model is busy` + **continuous SSE keepalive** (`: queued` / `: prefilling` / `: generating`) on any pause `>= 5s`, preventing client idle timeouts during long tool calls.
-  - **24 GB Unified Memory safety:** `LAMQ_GLOBAL_KV=fp8` (or `LAMQ_GLOBAL_KV=q4` for ultra-low KV footprint at 64K–128K), bounded Metal buffer cache (`--metal-cache-mb 256`), chunked prefill (`--prefill-chunk 256`), and `64 MiB` request body limit for 128K contexts + base64 screenshots.
-  - **Live token/state monitoring, FP8 tool-JSON typo auto-repair & loop guard:** logs accurate generation `tok/s` and parser state (`thinking`, `text`, `tool(name, buf=...)`, `discard_tool`), auto-repairs quantized Inkling-2 tool JSON missing `,"` before `args`/`arguments`, and cleanly stops verbatim 256-token repetition loops or stuck `discard_tool` runs.
-  - **SSRF protection:** remote `http(s)://` image URLs are disabled by default (`--allow-remote-images` enables them with private/loopback/link-local IP blocking); `file://` URLs are only allowed on loopback hosts.
+![SWE-bench Verified: Cloud Frontier vs Local Inkling-2-Mini](assets/cloud_vs_local_swebench.svg)
+
+Thinking Machines' **Inkling-2-Mini** (Apache 2.0) is a **26.4B looped Mixture-of-Experts (MoE)** model whose 12 middle layers loop 3 times per token (`48` logical layers, ~3.4B unique / ~5.4B effective active parameters). On the maintainers' published coding evaluations, it sits right next to flagship cloud APIs — and beats much larger open-weight models:
+
+| Official Benchmark *(Thinking Machines model card)* | **Inkling-2-Mini** *(26.4B MoE · Local 8.83 GB)* | Qwen3.8-27B *(27B Dense)* | Nemotron 3.5 Super VL *(125B)* | Gemma 4 31B *(31B Dense)* |
+|---|---:|---:|---:|---:|
+| **SWE-bench Verified** *(bash only)* | **79.2%** | 77.8% | — | — |
+| **SWE-bench Pro v2 (Hard)** | **77.9%** | 73.8% | 44.1% | 14.2% |
+| **DeepSWE v1.1** | **48.2%** | 42.2% | 24.7% | 0.3% |
+| **Terminal Bench v2.1** | **71.6%** | 73.0% | 60.7% | 43.4% |
+
+- [LookAtMyQuant](https://github.com/ShinMegamiBoson/lookatmyquant)'s **8.9 GB** build retains **99.2%–99.3%** of the untouched BF16 teacher's quality (3-task mean) while shrinking weights + 4-bit drafter to **8.83 GB**.
+- `inkling-mlx-vision` unlocks **native Vision**, **custom Metal SDPA/FA2 kernels** (zero quality loss, `rmse ≤ 6.1e-7`), **128K context stability**, and **2–3s chat starts** — so tasks that previously needed paid cloud APIs or a **36–64 GB Mac / 24 GB+ GPU rig** now run privately on an everyday **24 GB MacBook** alongside macOS, your IDE, Docker, and Chrome.
+
+### How It Compares by Specs on a 24 GB MacBook
+
+| Model / Setup | Architecture & Active Params | Vision | Speculative Drafter | Weight RAM | Context | Reality on a **24 GB Mac** *(with macOS + IDE + browser)* |
+|---|---|---|---|---:|---|---|
+| **Cloud APIs** *(Claude 4.6 / GPT-5.2 / Gemini 3)* | Frontier cloud | Yes | Server-side | 0 GB *(paid $/tok)* | 200K–1M | Requires internet, sends code to cloud, recurring API cost |
+| **`Inkling-2-Mini` (`LAMQ 8.9GB`) + `inkling-mlx-vision`** | **26.4B Looped MoE** (~3.4B unique / ~5.4B eff. active) | **Yes** *(0 GB idle via lazy mmap)* | **Yes** *(DSpark 3L, up to 8 tok/step)* | **8.83 GB** | **128K+** *(1M native)* | **Comfortable at 64K–128K** (~11–13 GB active, ~10+ GB free, **25–45+ tok/s**) |
+| **Qwen3.8-27B / Qwen3.5-27B** *(4-bit)* | 27B Dense *(27B active)* | Yes | No | ~16.5–17 GB | 128K–262K | **Tight & slower** (dense 27B bandwidth limit; swaps on long agent chats) |
+| **Qwen3-Coder-30B-A3B** *(4-bit)* | 30.5B MoE *(3.3B active)* | No *(text-only)* | No | ~17.2 GB | 256K | **Very tight** (19–22 GB even at short context; no screenshot input) |
+| **Gemma 3 27B** *(4-bit)* | 27B Dense *(27B active)* | Yes | No | ~17.0 GB | 128K | **32 GB+ recommended** (heavy swap alongside IDE + Chrome) |
+| **Qwen2.5-VL-7B** *(4-bit)* | 8.3B Dense *(8.3B active)* | Yes | No | ~5.0 GB | 128K | **Easy fit**, but 7B-class coding & reasoning capacity |
+
+---
+
+## Before vs. After: What Was Missing in Stock `lamq serve` — and What We Built
+
+![Stock lamq serve vs inkling-mlx-vision Speedups on 16-Core Apple M4 Pro](assets/before_after_speedup.svg)
+
+### The Starting Point
+
+Out of the box, `lookatmyquant`'s `lamq serve` already delivered remarkable compression (`8.83 GB` + 4-bit DSpark drafter), **but plugging it into a real coding IDE (ZCode, Cline, Continue) hit four walls:**
+1. **Text-only:** every screenshot sent by your IDE was stripped (`[image omitted: this server is text-only]`).
+2. **Long-context bottlenecks on M4 Pro / Max:** stock `T=2..8` DSpark verify SDPA ran scalar loops instead of Apple Silicon's `simdgroup_half8x8` matrix units; 16+ core M4 Pro/Max GPUs were throttled by 10-core base M4 grids; and Global KV buffers reallocated every `+256` tokens (`O(N²)` copy storms at 32K–128K).
+3. **~60-second cold starts on every new IDE chat:** coding agents send ~24K tokens of system prompt + tools on every new thread, and tiny auto-title requests evicted active chats from the prompt cache.
+4. **Agent instability:** parallel IDE requests hit `HTTP 503 model is busy`, long tool-call buffering triggered SSE idle timeouts, and occasional quantized FP8 tool-call JSON typos (`{"name":"read_file"args":{...}}`) or repetition loops could stall a turn.
+
+### What `inkling-mlx-vision` Adds
+
+1. **Native Pure-MLX Vision Tower (`0.00 GB` RAM tax on text turns)**
+   - Faithful pure-MLX implementation of Hugging Face `Inkling2ImageProcessor` + 23-layer BF16 `Inkling2VisionModel` (Retina/4K aspect-preserving scaling, RGBA checkerboard compositing, axial 2D RoPE, `2×2` spatial merger).
+   - **637 MB HTTP-Range extractor (`inkling-extract-vision`):** fetches *only* the 422 `vision_tower.*` tensors from Hugging Face without downloading the 16.9 GB full checkpoint.
+   - **Lazy on-demand mmap (~21 ms):** loads vision weights only when an image arrives and releases them before LLM prefill starts.
+   - **Image-hash-safe KV cache:** follow-up turns on the same screenshot take **0 ms ViT**, and two different screenshots of identical resolution never collide.
+
+2. **Custom Apple Silicon Metal Kernels & O(N) Engine (`accel.py`) — 100% Lossless**
+   - **GQA-Shared Split-K `simdgroup_half8x8` SDPA (`T=2..8`):** 3 GQA heads share one `BK=32` K/V tile load via hardware `simdgroup_multiply_accumulate` — **4.47×–5.46× faster** on DSpark block & tree verify at 32K–64K context (`rmse ≤ 6.1e-7`).
+   - **Lean-SRAM GQA-Shared FlashAttention-2 (`BQ=32, BK=32`, 15.6 KB SRAM):** **1.38×–1.54× faster** long-context prefill (`rmse ≤ 5.3e-8`).
+   - **16+ Core M4 Pro / Max Grid Tuning (`applegpu_g16s/c/d`):** removes 10-core base M4 throttling across `DenseStage` (**1.20×–1.90×**), `UnifiedMoESide` (**1.17×–1.76×**), and `T=1` Split-K SDPA (`48` splits).
+   - **O(N) Global KV Pre-allocation + Zero-Copy Chat Extension:** replaces `+256` reallocations with `4096`-step `_reserve_cap` (**118×** less KV copy overhead at 32K) and extends active chats in-place, cutting per-turn KV copies and peak RAM spikes in half.
+
+3. **Agent-IDE Production Hardening**
+   - **Dynamic preamble pinning:** automatically detects shared `system` + `tools` + leading `<system-reminder>` blocks (~24K tokens) and pins 1 shared snapshot — new chats start in **~2–3 seconds** instead of **~60 seconds**, refreshing automatically when tools/memory change.
+   - **Fair FIFO queue + continuous SSE keepalive:** eliminates `HTTP 503` errors and client idle timeouts during long tool calls.
+   - **Tool-call resilience & guards:** auto-repairs quantized tool JSON missing `,"` before `args`/`arguments`, reports accurate live generation `tok/s`, and cleanly aborts runaway 256-token repetition loops or stuck `discard_tool` states.
+
+| Capability / Bottleneck *(16-Core M4 Pro, 24 GB)* | Stock `lamq serve` | `inkling-mlx-vision` | Gain |
+|---|---|---|---|
+| **Vision (screenshots / UI / tool images)** | Text-only | Native BF16 MLX ViT (0 GB idle) | **Full multimodal** |
+| **Follow-up turn on cached screenshot** | N/A | **0 ms ViT**, instant KV reuse | **Zero ViT re-encode** |
+| **New agent chat (~24K sys/tools preamble)** | ~60s prefill every chat | **~2–3s** (pinned preamble) | **~24× faster start** |
+| **32K / 64K FP8 `T=8` tree(`4-3`) verify SDPA** | 8.21 ms / 13.25 ms | **1.50 ms / 2.72 ms** (`rmse 4–6e-7`) | **5.46× / 4.86× faster** |
+| **64K FP8 `T=256` prefill FA2** | 73.81 ms / visit | **48.07 ms** / visit (`rmse 2.7e-8`) | **1.54× faster** (`-206 ms`/chunk) |
+| **32K Global KV reallocation copies** | 4.74 s (`+256` step) | **0.04 s** (pre-reserved `4096`) | **118× less overhead** |
+| **Multi-turn chat KV copies** | 2 clones / turn | **1 clone** (in-place move + store) | **2× less copy & peak RAM** |
+| **Concurrent IDE requests (chat + title)** | `HTTP 503` + eviction | FIFO queue + short-prompt bypass | **Zero dropped requests** |
+| **FP8 tool-call JSON typo / loop stalls** | Tool dropped / hangs | Auto-repaired + loop & keepalive guards | **Reliable agent loops** |
 
 ---
 
 ## Quickstart
 
-### 1. Install
+Requires **macOS on Apple Silicon (M1/M2/M3/M4)** and **Python 3.11+**.
 
-Requires macOS on Apple Silicon (M1/M2/M3/M4) and Python 3.11+.
+### 1. Install
 
 ```zsh
 git clone https://github.com/qoder3/inkling-mlx-vision.git
@@ -48,13 +99,13 @@ uv pip install -e .
 
 ### 2. Extract `vision_tower.safetensors` (~637 MB)
 
-Download **only** the 637 MB vision weights from Hugging Face via HTTP Range requests (skips the 16.9 GB LLM shards):
+Downloads **only** the 637 MB vision weights from Hugging Face via HTTP Range requests (skips the 16.9 GB LLM shards):
 
 ```zsh
 inkling-extract-vision -o vision_tower.safetensors
 ```
 
-*(Already have `Inkling-2-Mini-oQ4e-mtp` locally? Extract in `<0.5s` offline:)*
+*(Already have `Inkling-2-Mini-oQ4e-mtp` locally? Extract offline in `<0.5s`:)*
 
 ```zsh
 inkling-extract-vision --from-local /path/to/Inkling-2-Mini-oQ4e-mtp -o vision_tower.safetensors
@@ -74,57 +125,26 @@ LAMQ_GLOBAL_KV=fp8 inkling-mlx-serve \
   --reasoning-effort medium --temp 0.6 --top-p 0.95
 ```
 
-Or use the portable launcher script (supports `--restart` and env overrides):
+Or use the included launcher script (supports `--restart` and env overrides like `LAMQ_GLOBAL_KV=q4` for ultra-long 64K–128K sessions):
 
 ```zsh
 ./scripts/start_server.sh --restart
 ```
 
----
-
-## Benchmarks (Apple M4 Pro, 24 GB Unified Memory)
-
-Measured with `Inkling-2-Mini-LookAtMyQuant-8.9GB` + 4-bit DSpark drafter + `LAMQ_GLOBAL_KV=fp8` + `--prefill-chunk 256` + `--context 131072`:
-
-| Workload | Speed / Latency | Memory (Active / Peak) |
-|---|---|---|
-| Model + 4-bit drafter idle load | 5.3s load | 8.83 GB |
-| Vision encoding (`480×320`, 96 tok) | 75–220 ms | 9.21 GB (0 GB retained after ViT) |
-| Vision encoding (`1280×800`, 640 tok) | 571 ms | 9.27 GB / 10.87 GB peak |
-| Vision encoding (`1920×1080`, 1,296 tok) | 1.15 s | +11.9 MB embeddings |
-| Follow-up turn on cached image | **0 ms ViT**, 0.3s prefill | 9.27 GB |
-| Prefill (`chunk=256`, 24K–32K ctx) | 260–330 tok/s (stock) + 1.38×–1.54× custom FA2 + O(N) KV | 10.8–12.9 GB peak |
-| Decode (with 4-bit DSpark drafter) | **24–45+ tok/s** (4.47×–5.46× faster global verify SDPA at 32K–64K) | 11–12 GB |
-
-### Custom Metal Kernel Benchmarks (16-Core Apple M4 Pro, Global Attention Visit)
-
-| Kernel / Workload | Stock `lookatmyquant` | `inkling-mlx-vision` (`accel.py`) | Speedup | Parity (`rmse`) |
-|---|---|---|---|---|
-| 32K FP8 `T=8` causal verify SDPA | 7.12 ms | **1.52 ms** | **4.68×** | `6.1e-7` |
-| 32K FP8 `T=8` tree(`4-3`) verify SDPA | 8.21 ms | **1.50 ms** | **5.46×** | `6.1e-7` |
-| 64K FP8 `T=8` causal verify SDPA | 12.05 ms | **2.70 ms** | **4.47×** | `4.3e-7` |
-| 64K FP8 `T=8` tree(`4-3`) verify SDPA | 13.25 ms | **2.72 ms** | **4.86×** | `4.3e-7` |
-| 64K FP8 `T=256` prefill FA2 | 73.81 ms | **48.07 ms** | **1.54×** | `2.7e-8` |
-| 64K Q4 `T=8` causal verify SDPA | 13.13 ms | **2.97 ms** | **4.43×** | `4.3e-7` |
-| 64K Q4 `T=256` prefill FA2 | 72.38 ms | **49.54 ms** | **1.46×** | `2.7e-8` |
-| `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
-| `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
-| `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
-| 32K Global KV reallocation copies | 4.74 s (`+256` step) | **0.04 s** (pre-reserved) | **118×** | bit-exact |
-
-### Memory Budget for 128K Context (`LAMQ_GLOBAL_KV=fp8`)
-
-- Packed model + 4-bit drafter: **8.83 GB**
-- Global KV (`fp8`) + drafter context: **~20 KiB / token** (`~0.65 GB` at 32K, `~1.3 GB` at 64K, `~2.6 GB` at 128K)
-- Vision Tower (lazy mmap): **0.00 GB** during text turns / LLM prefill
+On startup you should see:
+```text
+metal accel enabled: GQA-SG8 Split-K SDPA + GQA-FA2 prefill + O(N) KV(4096) + M4-Pro-16c tuning=on
+vision enabled: ./vision_tower.safetensors (636.6 MB BF16, lazy on-demand mmap)
+serving 'inkling-2-mini' on http://127.0.0.1:8080/v1
+```
 
 ---
 
-## Client Configuration
+## Connecting Your Coding Agent / Client
 
 ### ZCode (`~/.zcode/v2/provider_config.json`)
 
-To make ZCode send screenshots as `image_url` instead of stripping them, include `inputFormat.supportsImage: true` under `properties`:
+Enable `inputFormat.supportsImage: true` under `properties` so ZCode sends screenshots as `image_url` instead of stripping them:
 
 ```json
 {
@@ -149,7 +169,7 @@ To make ZCode send screenshots as `image_url` instead of stripping them, include
 
 ### OpenAI Python SDK / `curl`
 
-Standard OpenAI Chat Completions multimodal format (`data:image/png;base64,...`):
+Works with standard OpenAI multimodal Chat Completions (`data:image/png;base64,...`):
 
 ```python
 import base64
@@ -173,9 +193,46 @@ print(resp.choices[0].message.content)
 
 ---
 
+## Detailed Benchmarks & Memory Budget (16-Core Apple M4 Pro, 24 GB)
+
+| Workload | Speed / Latency | Memory (Active / Peak) |
+|---|---|---|
+| Model + 4-bit drafter idle load | 5.3–5.6s load | **8.83 GB** |
+| Vision encoding (`480×320`, 96 tok) | 75–220 ms | 9.21 GB (0 GB retained after ViT) |
+| Vision encoding (`1280×800`, 640 tok) | 571 ms | 9.27 GB / 10.87 GB peak |
+| Vision encoding (`1920×1080`, 1,296 tok) | 1.15 s | +11.9 MB embeddings |
+| Follow-up turn on cached screenshot | **0 ms ViT**, 0.3s prefill | 9.27 GB |
+| Live agent turn at 24.5K context (`chunk=256`) | **262 tok/s** prefill, **29 tok/s** gen | 11.48 GB active / 12.22 GB peak |
+| Decode (with 4-bit DSpark drafter) | **24–45+ tok/s** | 11–13 GB |
+
+- **KV memory budget (`fp8`):** ~20 KiB/tok (`~0.65 GB` at 32K, `~1.3 GB` at 64K, `~2.6 GB` at 128K).
+- **KV memory budget (`q4` via `LAMQ_GLOBAL_KV=q4`):** ~11 KiB/tok (~half the KV RAM for ultra-long 64K–128K chats).
+
+<details>
+<summary><strong>Full Kernel-Level Benchmarks (16-Core M4 Pro, Stock vs. Custom Metal)</strong></summary>
+
+| Kernel / Workload | Stock `lookatmyquant` | `inkling-mlx-vision` (`accel.py`) | Speedup | Parity (`rmse`) |
+|---|---:|---:|---:|---:|
+| 32K FP8 `T=8` causal verify SDPA | 7.12 ms | **1.52 ms** | **4.68×** | `6.1e-7` |
+| 32K FP8 `T=8` tree(`4-3`) verify SDPA | 8.21 ms | **1.50 ms** | **5.46×** | `6.1e-7` |
+| 64K FP8 `T=8` causal verify SDPA | 12.05 ms | **2.70 ms** | **4.47×** | `4.3e-7` |
+| 64K FP8 `T=8` tree(`4-3`) verify SDPA | 13.25 ms | **2.72 ms** | **4.86×** | `4.3e-7` |
+| 64K FP8 `T=256` prefill FA2 | 73.81 ms | **48.07 ms** | **1.54×** | `2.7e-8` |
+| 64K Q4 `T=8` causal verify SDPA | 13.13 ms | **2.97 ms** | **4.43×** | `4.3e-7` |
+| 64K Q4 `T=256` prefill FA2 | 72.38 ms | **49.54 ms** | **1.46×** | `2.7e-8` |
+| 32K FP8 `T=1` decode SDPA (`sp=48`) | 0.98 ms | **0.82 ms** | **1.19×** | `1.3e-9` |
+| `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
+| `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
+| `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
+| 32K Global KV reallocation copies | 4.74 s (`+256` step) | **0.04 s** (pre-reserved) | **118×** | bit-exact |
+
+</details>
+
+---
+
 ## Wrapper CLI Flags
 
-All standard `lamq serve` flags are supported alongside these wrapper options:
+All standard `lamq serve` flags are forwarded untouched alongside these wrapper options:
 
 | Flag | Default | Description |
 |---|---|---|
@@ -183,7 +240,7 @@ All standard `lamq serve` flags are supported alongside these wrapper options:
 | `--no-vision` | `false` | Disable vision tower explicitly |
 | `--vision-max-pixels INT` | `2457600` (`1920×1280`) | Aspect-preserving downscale threshold |
 | `--vision-max-side INT` | `2560` | Maximum image width or height after downscale |
-| `--allow-remote-images` | `false` | Allow fetching public `http(s)://` image URLs (private IPs blocked) |
+| `--allow-remote-images` | `false` | Allow fetching public `http(s)://` image URLs (private/loopback IPs blocked) |
 | `--metal-cache-mb INT` | `256` | MLX Metal buffer cache cap in MiB |
 | `--max-request-mb INT` | `64` | Maximum HTTP JSON request body size in MiB |
 | `--cache-min-tokens INT` | `2048` | Minimum text prompt length to cache (short titles bypass cache) |
@@ -196,7 +253,7 @@ All standard `lamq serve` flags are supported alongside these wrapper options:
 
 ## Development & Tests
 
-Run the offline unit test suite (requires no model weights):
+Run the offline unit + Metal numerical parity test suite (65 tests, requires no model weights):
 
 ```zsh
 uv pip install -e ".[dev]"
@@ -214,5 +271,5 @@ INKLING_LIVE_URL=http://127.0.0.1:8080 pytest tests/test_live_e2e.py -s
 ## Credits & License
 
 - Built on top of [ShinMegamiBoson/lookatmyquant](https://github.com/ShinMegamiBoson/lookatmyquant) (MIT License).
-- Vision architecture follows Hugging Face `transformers` `Inkling2VisionModel` / `Inkling2ImageProcessor` for Thinking Machines' `Inkling-2-Mini`.
+- Vision architecture follows Hugging Face `transformers` `Inkling2VisionModel` / `Inkling2ImageProcessor` for Thinking Machines' `Inkling-2-Mini` (Apache 2.0).
 - Released under the [MIT License](LICENSE). Model weights are **not** included and remain subject to their respective upstream licenses.
