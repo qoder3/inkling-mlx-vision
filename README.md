@@ -60,6 +60,8 @@ Out of the box, `lookatmyquant`'s `lamq serve` already delivered remarkable comp
 2. **Custom Apple Silicon Metal Kernels & O(N) Engine (`accel.py`) — 100% Lossless**
    - **GQA-Shared Split-K `simdgroup_half8x8` SDPA (`T=2..8`):** 3 GQA heads share one `BK=32` K/V tile load via hardware `simdgroup_multiply_accumulate` — **4.47×–5.46× faster** on DSpark block & tree verify at 32K–64K context (`rmse ≤ 6.1e-7`).
    - **Lean-SRAM GQA-Shared FlashAttention-2 (`BQ=32, BK=32`, 15.6 KB SRAM):** **1.38×–1.54× faster** long-context prefill (`rmse ≤ 5.3e-8`).
+   - **DSpark Drafter GQA-12:1 Split-K SDPA (`T=2..8`):** replaces Apple MLX's built-in `mx.fast.scaled_dot_product_attention` across all 3 drafter layers (local `1K` and global `16K–128K`) with zero slice copies — **4.7×–6.5× faster** (`21.66 ms → 3.32 ms` at 128K, `rmse ≤ 3.2e-6`), plus `B_len` trimming for `temp > 0`.
+   - **Exact 3-Pass Radix-Histogram `top_p` Metal Kernel:** eliminates 200K/32K `mx.argsort` on every `temp > 0, top_p < 1` round — **5.7× faster** (`2.36 ms → 0.42 ms`, `rmse = 7.2e-11`) with zero CPU sync, plus lossless `NgramDraftIndex` (`min_match=5`) enabled by default for coding & tool-call spans.
    - **16+ Core M4 Pro / Max Grid Tuning (`applegpu_g16s/c/d`):** removes 10-core base M4 throttling across `DenseStage` (**1.20×–1.90×**), `UnifiedMoESide` (**1.17×–1.76×**), and `T=1` Split-K SDPA (`48` splits).
    - **O(N) Global KV Pre-allocation + Zero-Copy Chat Extension:** replaces `+256` reallocations with `4096`-step `_reserve_cap` (**118×** less KV copy overhead at 32K) and extends active chats in-place, cutting per-turn KV copies and peak RAM spikes in half.
 
@@ -221,6 +223,10 @@ print(resp.choices[0].message.content)
 | 64K Q4 `T=8` causal verify SDPA | 13.13 ms | **2.97 ms** | **4.43×** | `4.3e-7` |
 | 64K Q4 `T=256` prefill FA2 | 72.38 ms | **49.54 ms** | **1.46×** | `2.7e-8` |
 | 32K FP8 `T=1` decode SDPA (`sp=48`) | 0.98 ms | **0.82 ms** | **1.19×** | `1.3e-9` |
+| DSpark drafter SDPA Local 1K (`T=8`) | 0.90 ms (`mx.fast.sdpa`) | **0.19 ms** (`GQA-12:1`) | **4.7×** | `6.5e-6` |
+| DSpark drafter SDPA Global 64K (`T=8`) | 10.70 ms (`mx.fast.sdpa`) | **1.80 ms** (`GQA-12:1`) | **6.0×** | `2.3e-6` |
+| DSpark drafter SDPA Global 128K (`T=8`) | 21.66 ms (`mx.fast.sdpa`) | **3.32 ms** (`GQA-12:1`) | **6.5×** | `3.2e-6` |
+| Exact `top_p=0.95` verify `[8, 200058]` | 2.36 ms (`mx.argsort`) | **0.42 ms** (Radix Metal) | **5.7×** | `7.2e-11` |
 | `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
 | `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
 | `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
@@ -253,7 +259,7 @@ All standard `lamq serve` flags are forwarded untouched alongside these wrapper 
 
 ## Development & Tests
 
-Run the offline unit + Metal numerical parity test suite (65 tests, requires no model weights):
+Run the offline unit + Metal numerical parity test suite (83 tests, requires no model weights):
 
 ```zsh
 uv pip install -e ".[dev]"

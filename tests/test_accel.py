@@ -212,3 +212,59 @@ def test_install_and_kv_reserve_cap():
     _drafter_mod.DSparkDrafterMLX._ensure_ctx_cap(fd, 1, 300)  # global layer -> 8192
     assert fd._ctx_cap[0] == 512
     assert fd._ctx_cap[1] == 8192
+    assert info["custom_drafter_gqa12_sdpa"] is True
+    assert info["custom_radix_topp"] is True
+    assert info["ngram_default"] is True
+    assert _model_mod.logits_to_probs is accel.fast_logits_to_probs
+
+
+@pytest.mark.parametrize("T", [2, 5, 6, 8])
+@pytest.mark.parametrize(
+    "lo,hi,kv_cap",
+    [
+        (0, 1031, 1280),       # local layer from 0
+        (517, 1549, 2048),     # local layer with non-zero sliding window lo
+        (0, 8219, 8448),       # global layer with 32 splits + partial tail
+    ],
+)
+def test_drafter_gqa12_sdpa_parity(T: int, lo: int, hi: int, kv_cap: int):
+    rng = np.random.default_rng(700 + T + lo + hi)
+    q = mx.array((rng.standard_normal((1, 24, T, 128)) * 0.5).astype(np.float16))
+    K = mx.array((rng.standard_normal((1, 2, kv_cap, 128)) * 0.5).astype(np.float16))
+    V = mx.array((rng.standard_normal((1, 2, kv_cap, 128)) * 0.5).astype(np.float16))
+    mx.eval(q, K, V)
+
+    ref = mx.fast.scaled_dot_product_attention(q, K[:, :, lo:hi, :], V[:, :, lo:hi, :], scale=128.0 ** -0.5)
+    got = accel.drafter_gqa_sdpa_fast(q, K, V, lo, hi, kv_cap)
+    assert got.dtype == mx.float16
+    _assert_close(got, ref, max_tol=5e-4, rmse_tol=5e-5)
+
+
+@pytest.mark.parametrize(
+    "shape,scale,temp,top_p",
+    [
+        ((8, 200058), 5.0, 0.6, 0.95),     # real Inkling-2 200K vocab (V % 4 == 2, tests unaligned rows!)
+        ((8, 200058), 0.2, 1.0, 0.95),     # ultra-flat 200K distribution
+        ((32768,), 4.0, 0.6, 0.95),        # 1D draft shortlist
+        ((5, 2003), 3.0, 0.7, 0.90),       # odd V tail handling
+        ((4, 4096), 5.0, 0.6, 0.05),       # single-token Pass-1 early exit
+        ((4, 4096), 2.0, 1.0, 0.999999),   # float-rounding boundary fallback
+    ],
+)
+def test_exact_radix_topp_parity(shape: tuple[int, ...], scale: float, temp: float, top_p: float):
+    rng = np.random.default_rng(900 + sum(shape) + int(top_p * 1000))
+    x = mx.array((rng.standard_normal(shape) * scale).astype(np.float32))
+    mx.eval(x)
+
+    ref = accel._ORIG_LOGITS_TO_PROBS(x, temp=temp, top_p=top_p, top_k=0)
+    got = accel.fast_logits_to_probs(x, temp=temp, top_p=top_p, top_k=0)
+    mx.eval(ref, got)
+    g = np.asarray(got, dtype=np.float32)
+    r = np.asarray(ref, dtype=np.float32)
+    assert g.shape == r.shape
+    assert np.all(np.isfinite(g)) and np.all(g >= 0.0)
+    row_sums = g.sum(axis=-1)
+    assert np.allclose(row_sums, 1.0, atol=1e-4)
+    diff = np.abs(g - r)
+    assert float(diff.max()) < 1e-5
+    assert float(np.sqrt(np.mean(diff * diff))) < 1e-7
