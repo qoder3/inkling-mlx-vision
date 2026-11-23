@@ -173,6 +173,43 @@ def normalize_messages_with_vision(
     return out, images_raw
 
 
+def _value_char_len(val: Any) -> int:
+    """Zero-allocation approximate serialized character length for strings/dicts/lists."""
+    if val is None:
+        return 0
+    if isinstance(val, str):
+        return len(val)
+    if isinstance(val, dict):
+        return sum(_value_char_len(k) + _value_char_len(v) + 4 for k, v in val.items())
+    if isinstance(val, (list, tuple)):
+        return sum(_value_char_len(x) + 2 for x in val)
+    return 6
+
+
+def message_char_count(messages: Any) -> int:
+    """Fast O(N)-char pre-tokenization size estimate across content, reasoning_content, and tool_calls."""
+    if not isinstance(messages, (list, tuple)):
+        return 0
+    total = 0
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        total += _value_char_len(m.get("content"))
+        total += _value_char_len(m.get("reasoning_content"))
+        for tc in m.get("tool_calls") or ():
+            if isinstance(tc, dict):
+                fn = tc.get("function")
+                if isinstance(fn, dict):
+                    total += _value_char_len(fn.get("name"))
+                    total += _value_char_len(fn.get("arguments"))
+    return total
+
+
+def exceeds_char_budget(tot_chars: int, ctx: int, max_chars_per_token: int = 10) -> bool:
+    """Return True when `tot_chars` is guaranteed to overflow `ctx` tokens (rejects before BPE)."""
+    return int(ctx) > 0 and int(tot_chars) >= int(ctx) * int(max_chars_per_token)
+
+
 def parse_extra_args(argv: list[str]) -> tuple[ServerConfig, list[str]]:
     """Extract wrapper-specific CLI flags before forwarding standard `lamq serve` flags."""
     default_vision = Path("vision_tower.safetensors")
@@ -430,6 +467,16 @@ def install_patches(cfg: ServerConfig) -> None:
         add_prompt = req.get("add_generation_prompt", True)
         if type(add_prompt) is not bool:
             raise _server.RequestError(400, "add_generation_prompt must be a boolean")
+        ctx = int(getattr(self.args, "context", 131072) or 131072)
+        if tokenize:
+            tot_chars = message_char_count(messages)
+            if exceeds_char_budget(tot_chars, ctx):
+                est_toks = tot_chars // 3
+                raise _server.RequestError(
+                    400,
+                    f"the request exceeds the available context size, try increasing it (prompt ~{est_toks} tokens, context {ctx})",
+                    "exceed_context_size_error",
+                )
         kw: dict[str, Any] = dict(tokenize=tokenize, add_generation_prompt=add_prompt, reasoning_effort=effort)
         if tools:
             kw["tools"] = tools
@@ -441,6 +488,12 @@ def install_patches(cfg: ServerConfig) -> None:
         pin_hint: int | None = None
         if tokenize:
             enc_ids = rendered["input_ids"] if (isinstance(rendered, dict) or hasattr(rendered, "input_ids")) else rendered
+            if len(enc_ids) >= ctx:
+                raise _server.RequestError(
+                    400,
+                    f"the request exceeds the available context size, try increasing it (prompt {len(enc_ids)} tokens, context {ctx})",
+                    "exceed_context_size_error",
+                )
             preamble_k = _cache_mod.count_preamble_messages(messages)
             if 0 < preamble_k < len(messages) and len(enc_ids) >= cfg.pin_min_tokens:
                 try:

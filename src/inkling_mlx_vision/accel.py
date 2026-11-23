@@ -1671,6 +1671,175 @@ def make_fast_moe_prefill_v3_kernel(
     )
 
 
+# --------------------------------------------------------------------------- Custom Metal Kernel 6: 2-Slot Parallel SwiGLU + Paley-72 RHT-1152
+
+
+@lru_cache(maxsize=16)
+def make_parallel_swiglu_rht1152_kernel(out_half: bool, also_raw: bool = False, skip_mode: int = 0, pad_zero: bool = False):
+    """2 slots per 288-thread threadgroup (`tg_z[32 * 73]` = 9.1 KB SRAM -> 2 TGs/core on M4 Pro).
+
+    Loads `signs` and every `72x72` Paley tile `Bm` ONCE per 2 slots and issues 4 `simdgroup_float8x8`
+    MACs per `Bm` load, halving barriers and B-matrix traffic during prefill. Same accumulation order
+    as the stock `_make_swiglu_rht1152_sg8_kernel`, so results are bit-identical (`max_diff == 0.0`).
+    """
+    ot4 = "half4" if out_half else "float4"
+    conv0 = "half4(tz4[tid] * INV_S)" if out_half else "(tz4[tid] * INV_S)"
+    conv1 = "half4(tz4[288u + tid] * INV_S)" if out_half else "(tz4[288u + tid] * INV_S)"
+    raw_conv = "half4(raw_act)" if out_half else "raw_act"
+    if skip_mode == 1:
+        extra_in = ["eids"]
+        skip_expr = "eids[{s}] == 0xFFFFFFFFu"
+    else:
+        extra_in = []
+        skip_expr = "false"
+    load_parts = []
+    for p in range(2):
+        skip_p = skip_expr.format(s=f"slot{p}")
+        raw_store = f"\n        ((device {ot4}*)(raw_out + (ulong)slot{p} * 1152u))[tid] = {raw_conv};" if also_raw else ""
+        raw_zero = (
+            f"\n    else if (in{p}) {{ ((device {ot4}*)(raw_out + (ulong)slot{p} * 1152u))[tid] = {ot4}(0.0f); }}"
+            if also_raw
+            else ""
+        )
+        load_parts.append(
+            f"""
+    const uint slot{p} = pair * 2u + {p}u;
+    const bool in{p} = slot{p} < n_slots;
+    const bool live{p} = in{p} && !({skip_p});
+    float4 act{p} = float4(0.0f);
+    if (live{p}) {{
+        const device float4* gp4 = (const device float4*)(y_gu + (ulong)slot{p} * 2304u);
+        const float4 g = gp4[tid], u = gp4[288u + tid];
+        const float4 raw_act = (metal::precise::tanh(g * g_inv) * g_cap)
+                             * (1.0f / (1.0f + metal::precise::exp(-g)))
+                             * (metal::precise::tanh(u * u_inv) * u_cap);{raw_store}
+        act{p} = raw_act * s4;
+    }}{raw_zero}
+    {{
+        threadgroup float* dst = tg_z + ({p * 16}u + a) * 73u + c;
+        dst[0] = act{p}.x; dst[1] = act{p}.y; dst[2] = act{p}.z; dst[3] = act{p}.w;
+    }}"""
+        )
+    raw_pad = f"\n        ((device {ot4}*)(raw_out + (ulong)n_slots * 1152u))[tid] = {ot4}(0.0f);" if also_raw else ""
+    pad_code = (
+        f"""
+    if (pair == 0u) {{
+        ((device {ot4}*)(out + (ulong)n_slots * 1152u))[tid] = {ot4}(0.0f);{raw_pad}
+    }}"""
+        if pad_zero
+        else ""
+    )
+    src = f"""
+    const uint pair = threadgroup_position_in_grid.y;
+    const uint simd = simdgroup_index_in_threadgroup; // 0..8
+    const uint lane = thread_index_in_simdgroup;      // 0..31
+    const uint tid = simd * 32u + lane;               // 0..287
+    const uint n_slots = meta[0];
+    const uint hw = lane >> 4, hl = lane & 15u;
+    const float g_cap = caps[0], g_inv = caps[1], u_cap = caps[2], u_inv = caps[3];
+    const float4 s4 = ((const device float4*)signs)[tid];
+    const uint a = tid / 18u, c = (tid - a * 18u) * 4u;
+
+    threadgroup float tg_z[32 * 73];
+{''.join(load_parts)}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint c0 = simd * 8u + hw * 4u;
+    const bool h1 = hl & 1u, h2 = hl & 2u, h4 = hl & 4u, h8 = hl & 8u;
+    #pragma unroll
+    for (uint pp = 0; pp < 2u; pp++) {{
+        threadgroup float* zrow = tg_z + (pp * 16u + hl) * 73u;
+        #pragma unroll
+        for (uint j = 0; j < 4u; j++) {{
+            const uint cc = c0 + j;
+            float v = zrow[cc];
+            float o;
+            o = simd_shuffle_xor(v, 1u); v = h1 ? (o - v) : (v + o);
+            o = simd_shuffle_xor(v, 2u); v = h2 ? (o - v) : (v + o);
+            o = simd_shuffle_xor(v, 4u); v = h4 ? (o - v) : (v + o);
+            o = simd_shuffle_xor(v, 8u); v = h8 ? (o - v) : (v + o);
+            zrow[cc] = v;
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 Acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Acc2 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Acc3 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    #pragma unroll
+    for (uint kb = 0; kb < 9u; kb++) {{
+        simdgroup_float8x8 Bm, Zm;
+        simdgroup_load(Bm, B + (simd * 8u) * 72u + kb * 8u, 72u, ulong2(0, 0), true);
+        simdgroup_load(Zm, tg_z + kb * 8u, 73u, ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(Acc0, Zm, Bm, Acc0);
+        simdgroup_load(Zm, tg_z + 8u * 73u + kb * 8u, 73u, ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(Acc1, Zm, Bm, Acc1);
+        simdgroup_load(Zm, tg_z + 16u * 73u + kb * 8u, 73u, ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(Acc2, Zm, Bm, Acc2);
+        simdgroup_load(Zm, tg_z + 24u * 73u + kb * 8u, 73u, ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(Acc3, Zm, Bm, Acc3);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(Acc0, tg_z + simd * 8u, 72u);
+    simdgroup_store(Acc1, tg_z + 8u * 72u + simd * 8u, 72u);
+    simdgroup_store(Acc2, tg_z + 16u * 72u + simd * 8u, 72u);
+    simdgroup_store(Acc3, tg_z + 24u * 72u + simd * 8u, 72u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr float INV_S = 0.02946278254943948f;
+    const threadgroup float4* tz4 = (const threadgroup float4*)tg_z;
+    if (live0) ((device {ot4}*)(out + (ulong)slot0 * 1152u))[tid] = {conv0};
+    if (live1) ((device {ot4}*)(out + (ulong)slot1 * 1152u))[tid] = {conv1};{pad_code}
+    """
+    out_names = ["out", "raw_out"] if also_raw else ["out"]
+    return mx.fast.metal_kernel(
+        name=f"ink_par2_swiglu_rht1152_{'h' if out_half else 'f'}_sk{skip_mode}_pz{int(pad_zero)}_ar{int(also_raw)}",
+        input_names=["y_gu", "signs", "B", "caps", "meta"] + extra_in,
+        output_names=out_names,
+        header="#include <metal_simdgroup_matrix>\n",
+        source=src,
+    )
+
+
+_ORIG_SWIGLU_RHT1152 = _fk.swiglu_rht_1152_fast
+_PAR_SWIGLU_MIN_SLOTS = int(os.environ.get("LAMQ_PAR_SWIGLU_MIN_SLOTS", "512"))
+
+
+def fast_swiglu_rht_1152(
+    y_gu: mx.array,
+    signs: mx.array,
+    gate_cap: float = 4.0,
+    up_cap: float = 25.0,
+    out_dtype=mx.float16,
+    pad_zero_row: bool = False,
+    eids_flat: mx.array | None = None,
+    offsets: mx.array | None = None,
+    also_raw: bool = False,
+):
+    """Drop-in `swiglu_rht_1152_fast` dispatching prefill-sized calls (`n_slots >= 512`) to Kernel 6."""
+    n_slots = int(y_gu.shape[0])
+    if n_slots < _PAR_SWIGLU_MIN_SLOTS or offsets is not None:
+        return _ORIG_SWIGLU_RHT1152(
+            y_gu, signs, gate_cap, up_cap, out_dtype=out_dtype, pad_zero_row=pad_zero_row,
+            eids_flat=eids_flat, offsets=offsets, also_raw=also_raw,
+        )
+    skip_mode = 1 if eids_flat is not None else 0
+    caps = _fk._f32_arr(gate_cap, 1.0 / gate_cap, up_cap, 1.0 / up_cap)
+    ins = [y_gu.reshape(-1), signs.reshape(-1), _fk._paley_b_flat(1152), caps, mx.array([n_slots], dtype=mx.uint32)]
+    if skip_mode == 1:
+        ins.append(eids_flat.astype(mx.uint32).reshape(-1))
+    out_shape = (n_slots + (1 if pad_zero_row else 0), 1152)
+    kern = make_parallel_swiglu_rht1152_kernel(out_dtype == mx.float16, also_raw, skip_mode, pad_zero_row)
+    outs = kern(
+        inputs=ins,
+        grid=(288, (n_slots + 1) // 2, 1),
+        threadgroup=(288, 1, 1),
+        output_shapes=[out_shape, out_shape] if also_raw else [out_shape],
+        output_dtypes=[out_dtype, out_dtype] if also_raw else [out_dtype],
+    )
+    return (outs[0], outs[1]) if also_raw else outs[0]
+
+
 # --------------------------------------------------------------------------- O(N) Global KV Allocation & M4 Pro Tuning
 
 
@@ -1688,6 +1857,12 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
     # 1. Install custom GQA-Shared SG8 SDPA kernels (used by both fast_kernels and model)
     _fk.gqa_relpos_sinks_sdpa_fast = accelerated_gqa_sdpa
     _model_mod.gqa_relpos_sinks_sdpa_fast = accelerated_gqa_sdpa
+
+    # 1b. Kernel 6 (opt-in, LAMQ_PAR_SWIGLU=1): 2-slot parallel SwiGLU + Paley-72 RHT-1152 (bit-exact).
+    #     Batched-GPU benchmarks on M4 Pro show parity-to-slightly-slower vs stock (memory-bound), so OFF by default.
+    if os.environ.get("LAMQ_PAR_SWIGLU", "0") == "1":
+        _fk.swiglu_rht_1152_fast = fast_swiglu_rht_1152
+        _model_mod.swiglu_rht_1152_fast = fast_swiglu_rht_1152
 
     # 2. Eliminate O(N^2) `+256` global KV reallocations in Inkling2Cache and DSparkDrafterMLX
     _kv_step = 4096
@@ -1965,7 +2140,33 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
             eos_set = frozenset(int(x) for x in (kwargs.get("eos_ids") or (200006,)))
             ctx = {"prompt_cache": pc, "ngram_idx": None, "eos_ids": eos_set}
             _stream_tls.ctx = ctx
-            gen = orig_stream_dspark(*args, **kwargs)
+            # Exact SpecInfer stochastic tree verification (temp > 0) + hybrid N-gram||DSpark 4-3 tree + Token Recycling.
+            # LAMQ_STOCHASTIC_TREE="auto" (default): adaptive 4-3 stochastic tree <-> 8-token chain;
+            # set to "4-3" (or any TREE_TOPOLOGIES key) to force fixed tree, or "0"/"off" for stock 1D chain.
+            st_tree = os.environ.get("LAMQ_STOCHASTIC_TREE", "auto").strip()
+            temp_val = float(kwargs.get("temp", 0.0) or 0.0)
+            explicit_tree = kwargs.get("tree")
+            no_margin = float(kwargs.get("max_logit_gap", 0.0) or 0.0) == 0.0 and kwargs.get("min_prob_ratio") is None
+            if temp_val > 0.0 and no_margin and explicit_tree is not None:
+                from .spec import stream_dspark_ext
+
+                gen = stream_dspark_ext(*args, **kwargs)
+            elif (
+                temp_val > 0.0
+                and no_margin
+                and explicit_tree is None
+                and kwargs.get("draft_len") is None
+                and st_tree not in ("", "0", "off", "false", "False")
+                and (st_tree == "auto" or st_tree in _drafter_mod.TREE_TOPOLOGIES)
+            ):
+                from .spec import stream_dspark_ext
+
+                kwargs["tree"] = "4-3" if st_tree == "auto" else st_tree
+                if st_tree == "auto":
+                    kwargs["adaptive_tree"] = True
+                gen = stream_dspark_ext(*args, **kwargs)
+            else:
+                gen = orig_stream_dspark(*args, **kwargs)
             try:
                 for chunk in gen:
                     ng = ctx.get("ngram_idx")
@@ -1995,7 +2196,7 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
     #     every 2 visits instead of 4 (-400 MB peak graph activations), cutting peak prefill RAM by >1 GB
     #     with bit-for-bit identical output (max_diff == 0.0).
     orig_forward_core_fast = _model_mod.Inkling2LoopPackedMLX._forward_core_fast
-    _low_mem_thresh = int(float(os.environ.get("LAMQ_LOW_MEM_THRESHOLD_GB", "14.5")) * (1 << 30))
+    _low_mem_thresh = int(float(os.environ.get("LAMQ_LOW_MEM_THRESHOLD_GB", "12.5")) * (1 << 30))
 
     def _adaptive_forward_core_fast(
         self,
@@ -2010,7 +2211,8 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
     ):
         n_tok = len(input_ids) if isinstance(input_ids, (list, tuple)) else int(input_ids.shape[-1])
         force_low = os.environ.get("LAMQ_LOW_MEM_PREFILL") == "1"
-        if n_tok < 64 or (not force_low and mx.get_active_memory() <= _low_mem_thresh):
+        is_short_bypass = 64 <= n_tok < 512 and getattr(cache, "seq_len", 0) == 0 and int(getattr(cache, "_reserve_cap", 0) or 0) == 0
+        if n_tok < 64 or (not force_low and not is_short_bypass and mx.get_active_memory() <= _low_mem_thresh):
             return orig_forward_core_fast(
                 self,
                 input_ids,

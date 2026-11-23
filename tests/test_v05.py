@@ -1,0 +1,509 @@
+"""Tests for v0.5.0 upgrades: pre-tokenization char gate, Kernel 6 (2-slot SwiGLU+RHT-1152),
+exact SpecInfer stochastic tree verification, Hybrid N-gram||DSpark trees, Token Recycling,
+Markov-state carryover, and Quest L1-bounding-box KV page selection."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import mlx.core as mx
+
+from inkling_mlx_vision import accel, quest, server, spec
+from runtime_mlx.inkling.drafter import TREE_TOPOLOGIES
+from runtime_mlx.inkling.fast_kernels import make_tree_spec
+
+
+# --------------------------------------------------------------------------- 1. Pre-tokenization char gate
+
+
+def test_utf8_byte_bound_pre_tokenization_gate():
+    msgs = [
+        {"role": "system", "content": "You are helpful."},
+        {
+            "role": "assistant",
+            "content": "Calling tool.",
+            "reasoning_content": "Let me think " * 10,
+            "tool_calls": [
+                {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": {"path": "a.py", "text": "x" * 500}}}
+            ],
+        },
+        {"role": "user", "content": [{"type": "text", "text": "hello"}, {"type": "image_url", "image_url": {"url": "data:..."}}]},
+    ]
+    cnt = server.message_char_count(msgs)
+    assert cnt > 600
+    assert not server.exceeds_char_budget(cnt, ctx=131072)
+
+    giant = [{"role": "user", "content": "a" * (131072 * 10)}]
+    assert server.exceeds_char_budget(server.message_char_count(giant), ctx=131072)
+
+    # Normalized dict tool arguments must also trigger the gate (not len(dict) == 1!)
+    giant_tool = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"function": {"name": "edit", "arguments": {"payload": "z" * (131072 * 10)}}}],
+        }
+    ]
+    assert server.exceeds_char_budget(server.message_char_count(giant_tool), ctx=131072)
+
+
+# --------------------------------------------------------------------------- 2. Kernel 6: 2-slot SwiGLU + RHT-1152
+
+
+@pytest.mark.parametrize("n_slots", [513, 1024])
+@pytest.mark.parametrize("out_dtype", [mx.float16, mx.float32])
+def test_parallel_swiglu_rht1152_parity(n_slots: int, out_dtype):
+    rng = np.random.default_rng(500 + n_slots)
+    y_gu = mx.array((rng.standard_normal((n_slots, 2304)) * 1.5).astype(np.float32))
+    signs = mx.array(np.where(rng.uniform(size=(1152,)) > 0.5, 1.0, -1.0).astype(np.float32))
+    eids = mx.array(np.where(rng.uniform(size=(n_slots,)) > 0.8, 0xFFFFFFFF, 7).astype(np.uint32))
+    mx.eval(y_gu, signs, eids)
+
+    for kw in ({}, {"also_raw": True}, {"eids_flat": eids, "also_raw": True}, {"pad_zero_row": True}):
+        ref = accel._ORIG_SWIGLU_RHT1152(y_gu, signs, 4.0, 25.0, out_dtype=out_dtype, **kw)
+        got = accel.fast_swiglu_rht_1152(y_gu, signs, 4.0, 25.0, out_dtype=out_dtype, **kw)
+        refs = ref if isinstance(ref, tuple) else (ref,)
+        gots = got if isinstance(got, tuple) else (got,)
+        mx.eval(*refs, *gots)
+        if "eids_flat" in kw:
+            keep = np.asarray(eids != 0xFFFFFFFF)[:, None]
+            r0 = np.asarray(refs[0], dtype=np.float32)[:n_slots]
+            g0 = np.asarray(gots[0], dtype=np.float32)[:n_slots]
+            assert float(np.max(np.where(keep, np.abs(r0 - g0), 0.0))) == 0.0
+            r1 = np.asarray(refs[1], dtype=np.float32)
+            g1 = np.asarray(gots[1], dtype=np.float32)
+            assert float(np.max(np.abs(r1 - g1))) == 0.0
+        else:
+            for r, g in zip(refs, gots):
+                assert float(np.max(np.abs(np.asarray(r, dtype=np.float32) - np.asarray(g, dtype=np.float32)))) == 0.0
+
+
+# --------------------------------------------------------------------------- 3. Exact SpecInfer Stochastic Tree Verification
+
+
+def _softmax_np(logits: np.ndarray, temp: float) -> np.ndarray:
+    z = (logits / temp) - np.max(logits / temp)
+    e = np.exp(z)
+    return e / np.sum(e)
+
+
+@pytest.mark.parametrize("dup_siblings", [False, True])
+def test_verify_tree_specinfer_dirac_exact_distribution(dup_siblings: bool):
+    """Exactness proof for Dirac (q_edges=None) multi-branch tree verification, including duplicate siblings."""
+    mx.random.seed(2026 + int(dup_siblings))
+    V = 12
+    temp = 0.8
+    tree_spec = make_tree_spec(TREE_TOPOLOGIES["4-3"])
+    rng = np.random.default_rng(77)
+    # Non-trivial permutation order_mx / inv_order to verify bucket-order indexing
+    perm = rng.permutation(V).astype(np.int32)
+    inv = np.argsort(perm).astype(np.int32)
+    order_mx = mx.array(perm)
+    inv_order = mx.array(inv)
+
+    logits_np = rng.standard_normal((8, V)).astype(np.float32) * 1.4
+    p0_ord = _softmax_np(logits_np[0], temp)
+    p0_vocab = np.zeros(V, dtype=np.float64)
+    p0_vocab[perm] = p0_ord
+
+    # Pick top-2 tokens in vocab space for root children (nodes 1 and 5)
+    top_v = np.argsort(-p0_vocab)
+    a1 = int(top_v[0])
+    b1 = a1 if dup_siblings else int(top_v[1])
+    draft_ids = mx.array([0, a1, 2, 3, 4, b1, 5, 6], dtype=mx.int32)
+    ord_logits = mx.array(logits_np)
+
+    n_trials = 3500
+    counts = np.zeros(V, dtype=np.int64)
+    branch_b_hits = 0
+    for _ in range(n_trials):
+        reached_mx, bonus_mx = spec.verify_tree_specinfer_gpu(
+            ord_logits, order_mx, inv_order, draft_ids, tree_spec, q_edges=None, cap=None, temp=temp
+        )
+        mx.eval(reached_mx, bonus_mx)
+        reached = np.asarray(reached_mx, dtype=bool).tolist()
+        path = [i for i, ok in enumerate(reached) if ok]
+        first_tok = int(draft_ids[path[1]]) if len(path) > 1 else int(bonus_mx)
+        counts[first_tok] += 1
+        if len(path) > 1 and path[1] == 5:
+            branch_b_hits += 1
+
+    emp = counts / n_trials
+    max_err = float(np.max(np.abs(emp - p0_vocab)))
+    assert max_err < 0.025, f"Dirac tree bias detected: max_err={max_err:.4f}, emp={emp}, ref={p0_vocab}"
+    if dup_siblings:
+        assert branch_b_hits == 0
+    else:
+        assert abs(branch_b_hits / n_trials - p0_vocab[b1]) < 0.025
+
+
+@pytest.mark.parametrize("hybrid_mode", [False, True])
+def test_verify_tree_specinfer_stochastic_q_exact_distribution(hybrid_mode: bool):
+    """Exactness + dominance proof for SpecInfer stochastic `q_edges` (with shortlist S < V and without-replacement split)."""
+    mx.random.seed(4040 + int(hybrid_mode))
+    V, S = 14, 9
+    temp = 0.7
+    tree_spec = make_tree_spec(TREE_TOPOLOGIES["4-3"])
+    rng = np.random.default_rng(123)
+    perm = rng.permutation(V).astype(np.int32)
+    inv = np.argsort(perm).astype(np.int32)
+    order_mx = mx.array(perm)
+    inv_order = mx.array(inv)
+    order_sub = order_mx[:S]
+
+    # Target p_0 has mass both inside shortlist [0..S-1] and in tail [S..V-1]
+    logits_np = rng.standard_normal((8, V)).astype(np.float32) * 1.1
+    p0_ord = _softmax_np(logits_np[0], temp)
+    p0_vocab = np.zeros(V, dtype=np.float64)
+    p0_vocab[perm] = p0_ord
+
+    # Draft q_0 over shortlist S with a deliberate distribution shift vs p_0
+    q_logits = logits_np[0, :S] + rng.standard_normal(S).astype(np.float32) * 0.6
+    q1_base = mx.array(_softmax_np(q_logits, temp).astype(np.float32))
+    q_dummy = mx.full((S,), 1.0 / S, dtype=mx.float32)
+    ord_logits = mx.array(logits_np)
+
+    n_trials = 4000
+    counts = np.zeros(V, dtype=np.int64)
+    root_accepts = 0
+    branch_b_accepts = 0
+    ng1_vocab = int(perm[2])  # fixed N-gram Branch A candidate for hybrid mode
+    ng1_ord = mx.array(2, dtype=mx.int32)
+
+    for _ in range(n_trials):
+        if hybrid_mode:
+            q_b1 = spec._zero_and_norm(q1_base, ng1_ord)
+            b1_ord = spec._sample_from_probs(q_b1)
+            b1_tok = order_sub[b1_ord]
+            draft_ids = mx.stack([
+                mx.array(0, dtype=mx.int32),
+                mx.array(ng1_vocab, dtype=mx.int32),
+                mx.array(int(perm[0]), dtype=mx.int32),
+                mx.array(int(perm[1]), dtype=mx.int32),
+                mx.array(int(perm[3]), dtype=mx.int32),
+                b1_tok,
+                mx.array(int(perm[4]), dtype=mx.int32),
+                mx.array(int(perm[5]), dtype=mx.int32),
+            ])
+            q_edges = [None, None, None, None, q_b1, q_dummy, q_dummy]
+        else:
+            a1_ord = spec._sample_from_probs(q1_base)
+            q_b1 = spec._zero_and_norm(q1_base, a1_ord)
+            b1_ord = spec._sample_from_probs(q_b1)
+            draft_ids = mx.stack([
+                mx.array(0, dtype=mx.int32),
+                order_sub[a1_ord],
+                mx.array(int(perm[0]), dtype=mx.int32),
+                mx.array(int(perm[1]), dtype=mx.int32),
+                mx.array(int(perm[3]), dtype=mx.int32),
+                order_sub[b1_ord],
+                mx.array(int(perm[4]), dtype=mx.int32),
+                mx.array(int(perm[5]), dtype=mx.int32),
+            ])
+            q_edges = [q1_base, q_dummy, q_dummy, q_dummy, q_b1, q_dummy, q_dummy]
+
+        reached_mx, bonus_mx = spec.verify_tree_specinfer_gpu(
+            ord_logits, order_mx, inv_order, draft_ids, tree_spec, q_edges=q_edges, cap=None, temp=temp
+        )
+        mx.eval(draft_ids, reached_mx, bonus_mx)
+        reached = np.asarray(reached_mx, dtype=bool).tolist()
+        path = [i for i, ok in enumerate(reached) if ok]
+        first_tok = int(draft_ids[path[1]]) if len(path) > 1 else int(bonus_mx)
+        counts[first_tok] += 1
+        if len(path) > 1:
+            root_accepts += 1
+            if path[1] == 5:
+                branch_b_accepts += 1
+
+    emp = counts / n_trials
+    max_err = float(np.max(np.abs(emp - p0_vocab)))
+    assert max_err < 0.025, f"SpecInfer stochastic tree bias (hybrid={hybrid_mode}): max_err={max_err:.4f}"
+    # Tail tokens outside shortlist [S..V-1] must also match exact target mass!
+    tail_vocab = perm[S:]
+    assert abs(float(emp[tail_vocab].sum() - p0_vocab[tail_vocab].sum())) < 0.025
+    # Branch B must actively rescue rejections!
+    assert branch_b_accepts > 50
+    if not hybrid_mode:
+        # 2-branch SpecInfer acceptance must strictly exceed 1D single-sample acceptance sum(min(p, q))!
+        single_branch_acc = float(np.sum(np.minimum(p0_ord[:S], np.asarray(q1_base))))
+        assert root_accepts / n_trials > single_branch_acc + 0.01
+
+
+# --------------------------------------------------------------------------- 4. Hybrid tree fusion & TokenRecycler
+
+
+def test_hybrid_tree_fusion_and_token_recycler():
+    ds_tree = mx.array([10, 20, 21, 22, 23, 30, 31, 32], dtype=mx.int32)
+    # Different root token -> Branch B keeps DSpark primary [20, 21, 22]
+    f1 = spec.fuse_hybrid_43(ds_tree, [10, 99, 98, 97, 96])
+    mx.eval(f1)
+    assert np.asarray(f1).tolist() == [10, 99, 98, 97, 96, 20, 21, 22]
+
+    # Colliding root token (ng1 == a1 == 20) -> Branch B switches to DSpark secondary [30, 31, 32]
+    f2 = spec.fuse_hybrid_43(ds_tree, [10, 20, 98, 97, 96])
+    mx.eval(f2)
+    assert np.asarray(f2).tolist() == [10, 20, 98, 97, 96, 30, 31, 32]
+
+    rec = spec.TokenRecycler(capacity=32, min_count=2)
+    # 1st occurrence -> not yet confident
+    rec.observe([1, 2, 3, 4, 5, 6])
+    rec.observe([1, 2])
+    assert rec.propose(4) is None
+    # 2nd consistent occurrence -> confident 4-token chain
+    rec.observe([3, 4, 5, 6, 1, 2])
+    assert rec.propose(4) == [3, 4, 5, 6]
+    # Conflicting transition resets count
+    rec.observe([99, 1, 2])
+    assert rec.propose(4) is None
+    # Capacity eviction
+    for i in range(60):
+        rec.observe([100 + i, 200 + i, 300 + i])
+    assert len(rec) <= 32
+
+
+# --------------------------------------------------------------------------- 5. End-to-end synthetic stream_dspark_ext
+
+
+class _MockLMHead:
+    def __init__(self, V: int, H: int, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        self.hidden_size = H
+        self.cap = 30.0
+        self._fast = False
+        perm = rng.permutation(V).astype(np.int32)
+        self.order_mx = mx.array(perm)
+        self.inv_order = mx.array(np.argsort(perm).astype(np.int32))
+        self.w = mx.array((rng.standard_normal((V, H)) * 0.4).astype(np.float32))
+
+    def _ordered_logits(self, h: mx.array) -> mx.array:
+        return h.reshape(-1, self.hidden_size).astype(mx.float32) @ self.w.T
+
+    def get_draft_head_topk(self):
+        def _topk(h: mx.array, k: int = 1) -> mx.array:
+            logits = self._ordered_logits(h)
+            part = mx.argpartition(-logits, k - 1, axis=-1)[:, :k]
+            vals = mx.take_along_axis(logits, part, axis=-1)
+            ord_k = mx.argsort(-vals, axis=-1)
+            top = mx.take_along_axis(part, ord_k, axis=-1)
+            return self.order_mx[top].astype(mx.int32)
+        return _topk
+
+    def get_draft_head_sampler(self, temp: float, top_p: float = 1.0, top_k: int = 0):
+        probs_fn, order_sub = spec.make_batched_draft_head_probs(self, temp=temp, top_p=top_p, top_k=top_k)
+
+        def _sample(h_1d: mx.array):
+            q = probs_fn(h_1d.reshape(1, self.hidden_size))[0]
+            o = spec._sample_from_probs(q)
+            return order_sub[o].astype(mx.int32), o, q
+        return _sample
+
+    def get_draft_head_argmax(self):
+        def _arg(h_1d: mx.array) -> mx.array:
+            return self.order_mx[mx.argmax(self._ordered_logits(h_1d)[0])].astype(mx.int32)
+        return _arg
+
+
+class _MockCache:
+    def __init__(self):
+        self.seq_len = 0
+        self.tree_commits = 0
+        self.spec_commits = 0
+
+    def begin_spec_verify(self):
+        pass
+
+    def commit_tree_verify(self, accepted_path: list[int], block_len: int):
+        self.seq_len += len(accepted_path)
+        self.tree_commits += 1
+
+    def commit_spec_verify(self, k_accept: int, block_len: int):
+        self.seq_len += k_accept
+        self.spec_commits += 1
+
+
+class _MockModel:
+    def __init__(self, V: int = 32, H: int = 16):
+        rng = np.random.default_rng(7)
+        self.lm_head = _MockLMHead(V, H, seed=8)
+        self._emb = mx.array((rng.standard_normal((V, H)) * 0.5).astype(np.float32))
+        self.H = H
+
+    def make_cache(self):
+        return _MockCache()
+
+    def embed(self, ids: mx.array) -> mx.array:
+        return self._emb[ids.reshape(-1)][None, :, :]
+
+    def forward_ordered_logits(self, ids, cache=None, tap_visits=()):
+        ids_mx = ids if isinstance(ids, mx.array) else mx.array(ids, dtype=mx.int32)
+        T = int(ids_mx.reshape(-1).shape[0])
+        h = self._emb[ids_mx.reshape(-1)]
+        logits = self.lm_head._ordered_logits(h)[None, :, :]
+        taps = mx.zeros((T, 4, self.H), dtype=mx.float32)
+        if cache is None:
+            cache = self.make_cache()
+        cache.seq_len += T
+        if tap_visits:
+            return logits, cache, taps
+        return logits, cache
+
+    def forward_argmax(self, ids, cache=None, tap_visits=()):
+        logits, cache, taps = self.forward_ordered_logits(ids, cache=cache, tap_visits=tap_visits or (5,))
+        preds = self.lm_head.order_mx[mx.argmax(logits, axis=-1)].astype(mx.int32)
+        if tap_visits:
+            return preds, cache, taps
+        return preds, cache
+
+    def forward_all_ordered_logits(self, ids, cache=None, tap_visits=(), tree_spec=None):
+        ids_mx = ids if isinstance(ids, mx.array) else mx.array(ids, dtype=mx.int32)
+        T = int(ids_mx.reshape(-1).shape[0])
+        h = self._emb[ids_mx.reshape(-1)]
+        logits = self.lm_head._ordered_logits(h)[None, :, :]
+        taps = mx.zeros((T, 4, self.H), dtype=mx.float32)
+        return logits, cache, taps
+
+
+class _MockDrafter:
+    def __init__(self, H: int = 16, R: int = 8):
+        self.block_size = 8
+        self.target_layer_ids = (5, 23, 41, 48)
+        self.H = H
+        self.R = R
+        self._zero_state = mx.zeros((R,), dtype=mx.float32)
+        self.f_rnn = mx.zeros((H,), dtype=mx.float32)
+        self.ctx_k = [None]
+        self.ctx_v = [None]
+        rng = np.random.default_rng(19)
+        self._proj = mx.array((rng.standard_normal((R, H)) * 0.2).astype(np.float32))
+
+    def reset(self):
+        pass
+
+    def push_context(self, taps: mx.array, start_pos: int):
+        self.f_rnn = mx.mean(taps[-1], axis=0)
+
+    def _run_3layers(self, anc_emb: mx.array, n_toks: int | None = None) -> mx.array:
+        n = self.block_size if n_toks is None else n_toks
+        return mx.broadcast_to(anc_emb[None, :], (n, self.H))
+
+    def _markov_step(self, state: mx.array, prev_tok: mx.array, h_s: mx.array):
+        B = int(prev_tok.shape[0])
+        new_st = 0.5 * state + 0.1
+        hp = mx.broadcast_to(h_s[None, :], (B, self.H)) + new_st @ self._proj
+        return new_st, hp
+
+    def propose_sample_gpu(self, anchor_tok, embed_fn, head_sample_fn, draft_len=None):
+        n = self.block_size if draft_len is None else draft_len
+        anc = mx.array([int(anchor_tok)], dtype=mx.int32)
+        h = self._run_3layers(embed_fn(anc)[0, 0, :], n_toks=n)
+        toks, ords, qs = [anc], [], []
+        st = self._zero_state[None, :]
+        cur = anc
+        for s in range(1, n):
+            st, hp = self._markov_step(st, cur, h[s])
+            t, o, q = head_sample_fn(hp[0])
+            cur = t.reshape(1)
+            toks.append(cur)
+            ords.append(o.reshape(1))
+            qs.append(q)
+        return mx.concatenate(toks, axis=0), mx.concatenate(ords, axis=0), mx.stack(qs, axis=0)
+
+
+@pytest.mark.parametrize("adaptive_tree", [False, True])
+def test_stream_dspark_ext_end_to_end_synthetic(adaptive_tree: bool):
+    mx.random.seed(99 + int(adaptive_tree))
+    model = _MockModel(V=32, H=16)
+    drafter = _MockDrafter(H=16, R=8)
+    # Repeating prompt pattern to exercise N-gram + Hybrid + TokenRecycler paths
+    prompt = [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3]
+    stats: dict = {}
+    out: list[int] = []
+    for chunk in spec.stream_dspark_ext(
+        model,
+        drafter,
+        prompt,
+        max_tokens=24,
+        eos_ids=(31,),
+        tree="4-3",
+        temp=0.6,
+        top_p=0.95,
+        ngram=True,
+        hybrid=True,
+        recycle=True,
+        markov_carry=True,
+        adaptive_tree=adaptive_tree,
+        stats_out=stats,
+    ):
+        out.extend(chunk)
+    assert 1 <= len(out) <= 24
+    assert all(0 <= t < 32 for t in out)
+    assert stats["mode"] == "dspark_tree_4-3_sample"
+    assert stats["generated_tokens"] == len(out)
+    assert stats["rounds"] >= 1
+
+
+# --------------------------------------------------------------------------- 6. Quest L1-Bounding-Box KV Page Filtering
+
+
+def test_quest_page_bounding_box_upper_bound():
+    rng = np.random.default_rng(2026)
+    n_kv, n_q, D, page = 8, 24, 128, 64
+    n_pages = 48
+    L = n_pages * page + 15  # includes partial tail!
+    K_np = (rng.standard_normal((n_kv, L, D)) * 0.5).astype(np.float16)
+    V_np = (rng.standard_normal((n_kv, L, D)) * 0.5).astype(np.float16)
+    q_np = (rng.standard_normal((n_q, D)) * 0.5).astype(np.float32)
+
+    # Plant a high-alignment needle key in distant page 20 for KV head 3 (stronger than page Gaussian envelope)
+    needle_page = 20
+    needle_pos = needle_page * page + 17
+    q_target = q_np[3 * 3]  # first query head of KV head 3
+    K_np[3, needle_pos, :] = (q_target / (np.linalg.norm(q_target) + 1e-6) * 24.0).astype(np.float16)
+
+    K = mx.array(K_np)
+    V = mx.array(V_np)
+    q = mx.array(q_np)
+
+    # Test incremental append across unaligned chunk sizes
+    idx = quest.QuestPageIndex(page=page)
+    pos = 0
+    for step in (37, 91, 128, 500, L):
+        end = min(L, pos + step)
+        if end > pos:
+            idx.append(K[:, pos:end, :])
+            pos = end
+    assert idx.n_tokens == L
+    assert idx.n_pages == n_pages
+
+    head_sc, kv_sc = idx.scores(q)
+    mx.eval(head_sc, kv_sc)
+    h_np = np.asarray(head_sc, dtype=np.float32)
+    kv_np = np.asarray(kv_sc, dtype=np.float32)
+
+    # 1. Exact parity against NumPy L1-box upper bound formula
+    K_f32 = K_np[:, : n_pages * page, :].astype(np.float32).reshape(n_kv, n_pages, page, D)
+    kmin_ref = K_f32.min(axis=2)
+    kmax_ref = K_f32.max(axis=2)
+    q_grp = q_np.reshape(n_kv, 3, D)
+    u_ref = np.maximum(q_grp[:, :, None, :] * kmin_ref[:, None, :, :], q_grp[:, :, None, :] * kmax_ref[:, None, :, :]).sum(axis=-1)
+    u_ref_flat = u_ref.reshape(n_q, n_pages)
+    assert float(np.max(np.abs(h_np - u_ref_flat))) < 2e-3
+    assert float(np.max(np.abs(kv_np - u_ref.max(axis=1)))) < 2e-3
+
+    # 2. Mathematical upper-bound theorem: U(q, p) >= max_{t in p} (q . k_t) for EVERY head & page!
+    dots = np.einsum("gqd,gpld->gqpl", q_grp, K_f32)
+    max_exact = dots.max(axis=-1).reshape(n_q, n_pages)
+    assert np.all(h_np + 2e-3 >= max_exact), f"Upper bound violated: min slack={float((h_np - max_exact).min())}"
+
+    # 3. Needle-in-a-haystack retrieval & attention accuracy
+    selected = idx.select(q, budget=4, n_local=4, n_sink=1)
+    assert needle_page in selected
+    assert 0 in selected
+    assert (n_pages - 1) in selected
+
+    dense_out = quest.quest_attention_reference(q, K, V, pages=None, page=page)
+    sparse_out = quest.quest_attention_reference(q, K, V, pages=selected, page=page)
+    mx.eval(dense_out, sparse_out)
+    # On the needle query head (head 9), sparse attention should closely match dense attention
+    err_needle = float(np.max(np.abs(np.asarray(dense_out[9]) - np.asarray(sparse_out[9]))))
+    assert err_needle < 5e-2, f"Needle head sparse error too large: {err_needle}"
