@@ -61,24 +61,29 @@ Out of the box, `lookatmyquant`'s `lamq serve` already delivered remarkable comp
    - **GQA-Shared Split-K `simdgroup_half8x8` SDPA (`T=2..8`):** 3 GQA heads share one `BK=32` K/V tile load via hardware `simdgroup_multiply_accumulate` — **4.47×–5.46× faster** on DSpark block & tree verify at 32K–64K context (`rmse ≤ 6.1e-7`).
    - **Lean-SRAM GQA-Shared FlashAttention-2 (`BQ=32, BK=32`, 15.6 KB SRAM):** **1.38×–1.54× faster** long-context prefill (`rmse ≤ 5.3e-8`).
    - **DSpark Drafter GQA-12:1 Split-K SDPA (`T=2..8`):** replaces Apple MLX's built-in `mx.fast.scaled_dot_product_attention` across all 3 drafter layers (local `1K` and global `16K–128K`) with zero slice copies — **4.7×–6.5× faster** (`21.66 ms → 3.32 ms` at 128K, `rmse ≤ 3.2e-6`), plus `B_len` trimming for `temp > 0`.
-   - **Exact 3-Pass Radix-Histogram `top_p` Metal Kernel:** eliminates 200K/32K `mx.argsort` on every `temp > 0, top_p < 1` round — **5.7× faster** (`2.36 ms → 0.42 ms`, `rmse = 7.2e-11`) with zero CPU sync, plus lossless `NgramDraftIndex` (`min_match=5`) enabled by default for coding & tool-call spans.
+   - **Exact 3-Pass Radix-Histogram `top_p` Metal Kernel:** eliminates 200K/32K `mx.argsort` on every `temp > 0, top_p < 1` round — **5.7× faster** (`2.36 ms → 0.42 ms`, `rmse = 7.2e-11`) with zero CPU sync, plus lossless `NgramDraftIndex` (`min_match=5`) enabled by default with **incremental `O(delta)` cross-turn reuse**.
+   - **Lean-SRAM Union-LUT Double-Buffered `tile_t=48` MoE Prefill v3 Metal Kernel (`nb_val ∈ {1..6}`, bit-exact `max_diff == 0.0`):** aliases mutually-exclusive Hadamard (`tg_ht4`) and RTR (`tg_rtr`) LUTs into one 8 KB union (`17.0 KB → 12.9/15.1 KB ≤ 16.0 KB` SRAM, doubling M4 Pro occupancy from 1 to **2 threadgroups/core**), adds fine-grained `nb_val ∈ {1..6}` (`8..48` tokens) specialization with register-balanced `Am[RB][4]` + 1-register `Xm` streaming (zero register spilling), and pairs with an **Adaptive Memory-Aware Gear-Shifting Chunk Scheduler (`1024 → 512 → 256`)** — accelerating 48-visit MoE prefill by **`+37.5%`** and end-to-end 48-visit prefill on `12.8GB` from `342.5 tok/s` to **`426.6 tok/s` (`+24.6%`)**.
    - **16+ Core M4 Pro / Max Grid Tuning (`applegpu_g16s/c/d`):** removes 10-core base M4 throttling across `DenseStage` (**1.20×–1.90×**), `UnifiedMoESide` (**1.17×–1.76×**), and `T=1` Split-K SDPA (`48` splits).
-   - **O(N) Global KV Pre-allocation + Zero-Copy Chat Extension:** replaces `+256` reallocations with `4096`-step `_reserve_cap` (**118×** less KV copy overhead at 32K) and extends active chats in-place, cutting per-turn KV copies and peak RAM spikes in half.
+   - **O(N) Global KV Pre-allocation + Zero-Copy Shared Global KV + Sliding-Window Trim (`W=1024`):** replaces `+256` reallocations with `4096`-step `_reserve_cap` (**118×** less KV copy overhead at 32K), shares append-only global KV buffers zero-copy between active generation and stored chat snapshots (**saves ~1.0–2.0 GB active RAM**), and trims 40 sliding KV slots back to `W=1024` on snapshot store.
 
-3. **Agent-IDE Production Hardening**
-   - **Dynamic preamble pinning:** automatically detects shared `system` + `tools` + leading `<system-reminder>` blocks (~24K tokens) and pins 1 shared snapshot — new chats start in **~2–3 seconds** instead of **~60 seconds**, refreshing automatically when tools/memory change.
+3. **Agent-IDE Production Hardening & SOTA Cache Orchestration**
+   - **3-Tier Post-Generation KV Cache Promotion (`post_gen → pre_tool_gen → base`):** promotes the live KV cache at the end of `<|content_thinking|>` reasoning (`pre_tool_gen`) and at the end of the turn (`post_gen`), so follow-up agent turns reuse 100% of the model's generated thinking and tool-call tokens without re-prefilling them.
+   - **Persistent Disk-Backed `pinned-sys` Snapshot (`~/.cache/inkling-mlx-vision/pinned_sys.safetensors`):** automatically detects shared `system` + `tools` + leading `<system-reminder>` blocks (~24K tokens), pins 1 shared snapshot in RAM (**~2–3s** new chat start), and persists it to disk so **cold starts after a server restart drop from ~60–90s to ~0.2s**.
+   - **24 GB Unified Memory OOM Guard for `12.8GB` (100% BF16-Fidelity) Build:** safely runs the `12.8GB` variant at 45K+ context with multimodal screenshots on a 24 GB Mac via safe `mx.set_wired_limit` clamping, pre-clone layer-by-layer ViT evaluation with automatic CPU fallback, cost-aware pre-eviction & side-query protection, in-place `move_hit` rollback on abort, and adaptive `cache_loop_w` release above `14.5 GiB`.
    - **Fair FIFO queue + continuous SSE keepalive:** eliminates `HTTP 503` errors and client idle timeouts during long tool calls.
-   - **Tool-call resilience & guards:** auto-repairs quantized tool JSON missing `,"` before `args`/`arguments`, reports accurate live generation `tok/s`, and cleanly aborts runaway 256-token repetition loops or stuck `discard_tool` states.
+   - **Tool-call resilience, fuzzy tool-name resolution & guards:** auto-repairs quantized tool JSON missing `,"` before `args`/`arguments`, canonicalizes snake_case/lowercase/synonym tool names (`bash`/`run_command` → `Bash`, `read_file` → `Read`, `todo_write` → `TodoWrite`) against the request's `tools` schema, reports accurate live generation `tok/s`, and cleanly aborts runaway 256-token repetition loops or stuck `discard_tool` states.
 
 | Capability / Bottleneck *(16-Core M4 Pro, 24 GB)* | Stock `lamq serve` | `inkling-mlx-vision` | Gain |
 |---|---|---|---|
 | **Vision (screenshots / UI / tool images)** | Text-only | Native BF16 MLX ViT (0 GB idle) | **Full multimodal** |
 | **Follow-up turn on cached screenshot** | N/A | **0 ms ViT**, instant KV reuse | **Zero ViT re-encode** |
-| **New agent chat (~24K sys/tools preamble)** | ~60s prefill every chat | **~2–3s** (pinned preamble) | **~24× faster start** |
+| **New agent chat (~24K sys/tools preamble)** | ~60s prefill every chat | **~2–3s** (RAM) / **~0.2s** (disk cache after restart) | **~24×–300× faster start** |
+| **Generated thinking + tool-call tokens on next turn** | Re-prefilled from scratch | **0 ms prefill** (3-tier `post_gen`/`pre_tool_gen` KV promotion) | **Instant turn handoff** |
+| **48-visit 12.8GB Prefill (`1024` tokens)** | 2,990 ms (`342.5 tok/s`, `chunk=256`) | **2,400 ms (`426.6 tok/s`)** (`tile_t=48` MoE v3 + adaptive chunk) | **+24.6% faster** (`max_diff 0.0`) |
 | **32K / 64K FP8 `T=8` tree(`4-3`) verify SDPA** | 8.21 ms / 13.25 ms | **1.50 ms / 2.72 ms** (`rmse 4–6e-7`) | **5.46× / 4.86× faster** |
 | **64K FP8 `T=256` prefill FA2** | 73.81 ms / visit | **48.07 ms** / visit (`rmse 2.7e-8`) | **1.54× faster** (`-206 ms`/chunk) |
 | **32K Global KV reallocation copies** | 4.74 s (`+256` step) | **0.04 s** (pre-reserved `4096`) | **118× less overhead** |
-| **Multi-turn chat KV copies** | 2 clones / turn | **1 clone** (in-place move + store) | **2× less copy & peak RAM** |
+| **Multi-turn chat KV copies** | 2 clones / turn | **Zero-copy shared global KV** (in-place move + shared store) | **Saves ~1.0–2.0 GB RAM** |
 | **Concurrent IDE requests (chat + title)** | `HTTP 503` + eviction | FIFO queue + short-prompt bypass | **Zero dropped requests** |
 | **FP8 tool-call JSON typo / loop stalls** | Tool dropped / hangs | Auto-repaired + loop & keepalive guards | **Reliable agent loops** |
 
@@ -230,6 +235,7 @@ print(resp.choices[0].message.content)
 | `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
 | `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
 | `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
+| `UnifiedMoESide` 48× Prefill (`1024` tok, 12.8GB) | 2,846.8 ms (`v2, tile_t=32`) | **1,553.9 ms** (`v3, tile_t=48, nb=1..6`) | **1.83×** | bit-exact (`0.0`) |
 | 32K Global KV reallocation copies | 4.74 s (`+256` step) | **0.04 s** (pre-reserved) | **118×** | bit-exact |
 
 </details>

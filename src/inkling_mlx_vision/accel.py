@@ -24,6 +24,7 @@ All optimizations are 100% mathematically equivalent (bit-exact or FP16-epsilon 
 from __future__ import annotations
 
 import os
+import threading
 from functools import lru_cache
 from typing import Any
 
@@ -501,8 +502,11 @@ def make_gqa_shared_prefill_fa2_kernel(kv_mode: str = "fp8", q_tiles: int = 4, b
         }}
 
         const int d_min = (int)q_pos_min - (int)(kv_start + k0 + {bk - 1}u);
-        const bool need_rel = (d_min < 1024) && ((int)q_pos_max >= (int)(kv_start + k0));
-        const bool fast_no_rel = (q0 + {bq}u <= T) && (k0 + {bk}u <= k_hi) && (d_min >= 1024) && !is_sliding;
+        const int d_max = (int)q_pos_max - (int)(kv_start + k0);
+        const bool full_tile = (q0 + {bq}u <= T) && (k0 + {bk}u <= k_hi);
+        const bool need_rel = (d_min < 1024) && (d_max >= 0);
+        const bool fast_no_rel = full_tile && (d_min >= 1024) && !is_sliding;
+        const bool fast_all_rel = full_tile && (d_min >= 0) && (d_max < 1024);
 
         float m_tile = -1e30f;
         float2 sv[{kb_cnt}];
@@ -510,6 +514,18 @@ def make_gqa_shared_prefill_fa2_kernel(kv_mode: str = "fp8", q_tiles: int = 4, b
             #pragma unroll
             for (uint kb = 0u; kb < {kb_cnt}u; kb++) {{
                 float2 s2 = ELEMS_F2(S[kb].thread_elements());
+                sv[kb] = s2;
+                m_tile = max(m_tile, max(s2.x, s2.y));
+            }}
+        }} else if (fast_all_rel) {{
+            #pragma unroll
+            for (uint kb = 0u; kb < {kb_cnt}u; kb++) {{
+                float2 s2 = ELEMS_F2(S[kb].thread_elements());
+                const uint da = (uint)((int)q_pos - (int)(kv_start + k0 + kb * 8u + fn));
+                const device half4* rpa = (const device half4*)(rel_proj_t + (ulong)da * 16u);
+                const device half4* rpb = (const device half4*)(rel_proj_t + (ulong)(da - 1u) * 16u);
+                s2.x += dot(rs0, float4(rpa[0])) + dot(rs1, float4(rpa[1])) + dot(rs2, float4(rpa[2])) + dot(rs3, float4(rpa[3]));
+                s2.y += dot(rs0, float4(rpb[0])) + dot(rs1, float4(rpb[1])) + dot(rs2, float4(rpb[2])) + dot(rs3, float4(rpb[3]));
                 sv[kb] = s2;
                 m_tile = max(m_tile, max(s2.x, s2.y));
             }}
@@ -1311,6 +1327,350 @@ def fast_logits_to_probs(logits: mx.array, *, temp: float, top_p: float = 1.0, t
     return _ORIG_LOGITS_TO_PROBS(logits, temp=temp, top_p=top_p, top_k=top_k)
 
 
+# --------------------------------------------------------------------------- Custom Metal Kernel 5: Lean-SRAM Union-LUT MoE Prefill v3
+
+
+@lru_cache(maxsize=64)
+def make_fast_moe_prefill_v3_kernel(
+    n: int,
+    fids: tuple[int, ...],
+    sorted_in: bool = False,
+    sorted_out: bool = False,
+    sg: int = 4,
+    rb: int = 2,
+    n_rg: int = 1,
+    max_nb: int = 4,
+):
+    """High-occupancy Apple Silicon Metal MoE prefill kernel (`sg=4, rb=2, tile_t=32 or 48`).
+
+    Improvements over stock `_make_unified_moe_prefill_v2_kernel`:
+      1. Aliases mutually-exclusive `tg_ht4` (4 KB) and `tg_rtr` (8 KB) into ONE 8 KB threadgroup union
+         (`tg_lut_u[1024]`), dropping threadgroup SRAM from 17.0 KB -> 12.9 KB (`tile_t=32`) or 15.1 KB
+         (`tile_t=48`, both <= 16.0 KB) and doubling hardware occupancy from 1 threadgroup/core to
+         2 threadgroups/core on Apple M4 / M4 Pro / M4 Max.
+      2. Fine-grained `nb_val in (1, 2, 3, 4, 5, 6)` (`8, 16, 24, 32, 40, 48` tokens) specialization:
+         - At `T >= 512` (`tile_t=48, max_nb=6`), eliminates the 2nd DRAM weight pass on all `33..48`-token
+           experts (`190 -> 128` work units at `T=512`, `317 -> 251` work units at `T=1024`).
+         - For `nb_val = 6` (`41..48` tokens), trades `Xm[6][4]` (`24` regs) for `Am[RB][4]` (`8` regs) +
+           1-register `Xm` streaming from `tg_x`, keeping total matrix registers at `33` (zero register spilling!).
+      3. Multi-pass `X` tile loading (`tok_stride = sg * 4`) so `sg=4` (128 threads) loads all `1..48`
+         tokens cleanly at any `T` (`T=256, 512, 1024`) with exact `max_diff == 0.0` parity vs `sg=8`.
+    """
+    steps = n // 32
+    tok_stride = sg * 4
+    max_tok_cap = 8 * max_nb
+    nb_tuple = tuple(range(1, max_nb + 1))
+    has_ht = any(f in fids for f in (0, 1, 2))
+    has_rtr = any(f in fids for f in (3, 4, 5))
+    has_nv = 7 in fids
+    H = [
+        "#include <metal_simdgroup_matrix>\n",
+        f"#define SG {sg}u\n#define RB {rb}u\n#define XSTR 36u\n#define PING_STRIDE ({max_tok_cap}u * XSTR)\n",
+        "#define ELEMS_H2 reinterpret_cast<thread half2&>\n",
+        "#define ELEMS_F2 reinterpret_cast<thread float2&>\n",
+    ]
+    ha = H.append
+
+    def _emit_x_load(max_t: int, xbase_name: str, step_offset_expr: str, dst_off_expr: str):
+        n_passes = (max_t + tok_stride - 1) // tok_stride
+        for p_idx in range(n_passes):
+            ti_expr = "tok_i" if p_idx == 0 else f"(tok_i + {p_idx * tok_stride}u)"
+            cond = f"if ({ti_expr} < {max_t}u)" if (p_idx + 1) * tok_stride > max_t or tok_stride > max_t else ""
+            ha(f"        {cond} {{")
+            ha(f"            const uint ti = {ti_expr};")
+            ha(
+                f"            const half4 xv = (ti < cnt) ? *(const device half4*)({xbase_name} + (ulong)tg_xrow[ti] * {n}u + {step_offset_expr} + 4u * vec_k) : half4(0.0h);"
+            )
+            ha(f"            threadgroup half* rowp = tg_x + {dst_off_expr} + ti * XSTR;")
+            ha("            *(threadgroup half2*)(rowp + (vk_h * 2u) * 8u + vk_q * 2u) = xv.xy;")
+            ha("            *(threadgroup half2*)(rowp + (vk_h * 2u + 1u) * 8u + vk_q * 2u) = xv.zw;")
+            ha("        }")
+
+    def _emit_decode_am(fid: int, target_fn):
+        k = {0: 1, 1: 2, 2: 3, 3: 1, 4: 2, 5: 3, 6: 4}[fid]
+        wpr_c = (n * k) // 32
+        if fid in (0, 1):
+            if fid == 1:
+                ha(f"            const uint w0 = pw[0]; const uint lo = (off == 0u) ? w0 : ((w0 >> 16u) | (((wi + 1u < {wpr_c}u) ? pw[1] : 0u) << 16u));")
+            else:
+                ha(f"            const uint w0 = pw[0], w1 = (wi + 1u < {wpr_c}u) ? pw[1] : 0u; const uint lo = (w0 >> off) | (off == 0u ? 0u : (w1 << (32u - off)));")
+            ha(f"            const half4 v0 = tg_ht4[((extract_bits(lo, {4 * k}u, 12u)) * {_fk.HASH_MULT_HEX}) >> 23u];")
+            ha(f"            const half4 v1 = tg_ht4[((extract_bits(lo, 0u, 12u)) * {_fk.HASH_MULT_HEX}) >> 23u];")
+            for j, expr in [(0, "v0.xy"), (1, "v0.zw"), (2, "v1.xy"), (3, "v1.zw")]:
+                ha(f"            {target_fn(j, expr)}")
+        elif fid == 2:
+            ha(f"            const uint w0 = pw[0], w1 = (wi + 1u < {wpr_c}u) ? pw[1] : 0u;")
+            ha("            const uint lo = (w0 >> off) | (off == 0u ? 0u : (w1 << (32u - off)));")
+            for j, rb_b in [(0, 18), (1, 12), (2, 6), (3, 0)]:
+                expr = f"tg_ht2[(extract_bits(lo, {rb_b}u, 12u) * {_fk.HASH_MULT_HEX}) >> 22u]"
+                ha(f"            {target_fn(j, expr)}")
+        elif fid == 3:
+            ha("            const uint w0 = pw[0]; const uint lo = (off == 0u) ? w0 : ((w0 >> off) | (w_prev[i] << (32u - off))); w_prev[i] = w0;")
+            for j, sh in [(0, 6), (1, 4), (2, 2), (3, 0)]:
+                ex = f"extract_bits(lo, {sh}u, 13u)"
+                ha(f"            {target_fn(j, _fk._rtr_value(3, 2, ex))}")
+        elif fid == 4:
+            ha(f"            const uint w0 = pw[0]; const uint lo = (off == 0u) ? w0 : ((w0 >> 16u) | (((wi + 1u < {wpr_c}u) ? pw[1] : 0u) << 16u));")
+            for j, rb_b in [(0, 12), (1, 8), (2, 4), (3, 0)]:
+                ex = f"extract_bits(lo, {rb_b}u, 14u)"
+                ha(f"            {target_fn(j, _fk._rtr_value(4, 2, ex))}")
+        elif fid == 5:
+            ha(f"            const uint w0 = pw[0], w1 = (wi + 1u < {wpr_c}u) ? pw[1] : 0u, w2 = (wi + 2u < {wpr_c}u) ? pw[2] : 0u;")
+            ha("            const uint lo = (w0 >> off) | (off == 0u ? 0u : (w1 << (32u - off)));")
+            ha("            const uint hi = (w1 >> off) | (off == 0u ? 0u : (w2 << (32u - off)));")
+            for j, rb_b in [(0, 18), (1, 12), (2, 6), (3, 0)]:
+                ex = f"extract_bits(lo, {rb_b}u, 15u)" if rb_b + 15 <= 32 else f"insert_bits(extract_bits(lo, {rb_b}u, {32 - rb_b}u), hi, {32 - rb_b}u, {15 - (32 - rb_b)}u)"
+                ha(f"            {target_fn(j, _fk._rtr_value(5, 2, ex))}")
+        elif fid == 6:
+            ha(f"            const uint w0 = pw[0], w1 = (wi + 1u < {wpr_c}u) ? pw[1] : 0u;")
+            for j, (b0, b1) in [(0, (28, 24)), (1, (20, 16)), (2, (12, 8)), (3, (4, 0))]:
+                ex0 = f"extract_bits(w0, {b0}u, 12u)" if b0 + 12 <= 32 else f"insert_bits(extract_bits(w0, {b0}u, {32 - b0}u), w1, {32 - b0}u, {12 - (32 - b0)}u)"
+                ex1 = f"extract_bits(w0, {b1}u, 12u)" if b1 + 12 <= 32 else f"insert_bits(extract_bits(w0, {b1}u, {32 - b1}u), w1, {32 - b1}u, {12 - (32 - b1)}u)"
+                expr = f"half2(lut_rtr4[{ex0}], lut_rtr4[{ex1}])"
+                ha(f"            {target_fn(j, expr)}")
+
+    for fid in fids:
+        if fid == 7:
+            wpr_nv, spr_nv = n // 8, n // 16
+            for nb_val in nb_tuple:
+                max_t = 8 * nb_val
+                use_stream = nb_val >= 6
+                ha(
+                    f"inline void umoe_v3_f7_nb{nb_val}("
+                    "const device half* xbase, const device uint* ecodes, const device uchar* env_scales, float eouter, "
+                    "threadgroup half* tg_x, const threadgroup half* tg_e2m1, const threadgroup half* tg_e4m3, "
+                    "const threadgroup uint* tg_xrow, const threadgroup uint* tg_out_slot, device float* y, "
+                    "uint rbase, uint m_rows, uint y_stride, uint cnt, uint tid, uint lane) {"
+                )
+                ha("    const uint tok_i = tid >> 3, vec_k = tid & 7u, vk_q = vec_k >> 1, vk_h = vec_k & 1u;")
+                ha("    const uint qid = lane / 4u, fm = (qid & 4u) + ((lane / 2u) % 4u), fn = (qid & 2u) * 2u + (lane % 2u) * 2u;")
+                ha("    const uint q = fn / 2u, r0 = rbase + fm;")
+                ha("    const device uint* p_c[RB]; const device uchar* p_s[RB];")
+                ha(f"    for (uint i = 0; i < RB; i++) {{ const uint rr = min(r0 + 8u * i, m_rows - 1u); p_c[i] = ecodes + (ulong)rr * {wpr_nv}u; p_s[i] = env_scales + (ulong)rr * {spr_nv}u; }}")
+                ha(f"    simdgroup_float8x8 Acc[RB][{nb_val}];")
+                ha(f"    for (uint i = 0; i < RB; i++) for (uint b = 0; b < {nb_val}u; b++) Acc[i][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);")
+                _emit_x_load(max_t, "xbase", "0u", "0u")
+                ha("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                ha(f"    for (uint s = 0; s < {steps}u; s++) {{")
+                ha("        const uint cur_off = (s & 1u) * PING_STRIDE, nxt_off = ((s + 1u) & 1u) * PING_STRIDE;")
+                ha(f"        if (s + 1u < {steps}u) {{")
+                _emit_x_load(max_t, "xbase", "32u * (s + 1u)", "nxt_off")
+                ha("        }")
+                ha("        if (rbase < m_rows) {")
+                if not use_stream:
+                    ha(f"            simdgroup_half8x8 Xm[{nb_val}][4];")
+                    ha("            #pragma unroll")
+                    ha(f"            for (uint b = 0; b < {nb_val}u; b++) {{")
+                    ha("                #pragma unroll")
+                    ha("                for (uint j = 0; j < 4u; j++) simdgroup_load(Xm[b][j], tg_x + cur_off + (8u * b) * XSTR + 8u * j, XSTR, ulong2(0, 0), true);")
+                    ha("            }")
+                    ha("            #pragma unroll")
+                    ha("            for (uint i = 0; i < RB; i++) {")
+                    ha("                const uint w0 = p_c[i][4u * s + q];")
+                    ha("                const half bsc = tg_e4m3[p_s[i][2u * s + (q >> 1)]];")
+                    ha("                simdgroup_half8x8 Am;")
+                    for j in range(4):
+                        ha(f"                ELEMS_H2(Am.thread_elements()) = half2(tg_e2m1[(w0 >> {8 * j}u) & 15u], tg_e2m1[(w0 >> {8 * j + 4}u) & 15u]) * bsc;\n                #pragma unroll\n                for (uint b = 0; b < {nb_val}u; b++) simdgroup_multiply_accumulate(Acc[i][b], Am, Xm[b][{j}], Acc[i][b]);")
+                    ha("            }")
+                else:
+                    ha("            simdgroup_half8x8 Am[RB][4];")
+                    ha("            #pragma unroll")
+                    ha("            for (uint i = 0; i < RB; i++) {")
+                    ha("                const uint w0 = p_c[i][4u * s + q]; const half bsc = tg_e4m3[p_s[i][2u * s + (q >> 1)]];")
+                    for j in range(4):
+                        ha(f"                ELEMS_H2(Am[i][{j}].thread_elements()) = half2(tg_e2m1[(w0 >> {8 * j}u) & 15u], tg_e2m1[(w0 >> {8 * j + 4}u) & 15u]) * bsc;")
+                    ha("            }")
+                    ha("            #pragma unroll")
+                    ha(f"            for (uint b = 0; b < {nb_val}u; b++) {{")
+                    ha("                #pragma unroll")
+                    ha("                for (uint j = 0; j < 4u; j++) {")
+                    ha("                    simdgroup_half8x8 Xm; simdgroup_load(Xm, tg_x + cur_off + (8u * b) * XSTR + 8u * j, XSTR, ulong2(0, 0), true);")
+                    ha("                    #pragma unroll")
+                    ha("                    for (uint i = 0; i < RB; i++) simdgroup_multiply_accumulate(Acc[i][b], Am[i][j], Xm, Acc[i][b]);")
+                    ha("                }")
+                    ha("            }")
+                ha("        }")
+                ha("        threadgroup_barrier(mem_flags::mem_threadgroup);")
+                ha("    }")
+                ha("    if (rbase < m_rows) {")
+                ha("        for (uint i = 0; i < RB; i++) {")
+                ha("            const uint row = r0 + 8u * i; if (row >= m_rows) continue;")
+                ha("            #pragma unroll")
+                ha(f"            for (uint b = 0; b < {nb_val}u; b++) {{")
+                ha("                const uint ta = 8u * b + fn, tb = ta + 1u;")
+                ha("                const float2 d = ELEMS_F2(Acc[i][b].thread_elements()) * eouter;")
+                ha("                if (ta < cnt) y[(ulong)tg_out_slot[ta] * y_stride + row] = d.x;")
+                ha("                if (tb < cnt) y[(ulong)tg_out_slot[tb] * y_stride + row] = d.y;")
+                ha("            }")
+                ha("        }")
+                ha("    }")
+                ha("}")
+            continue
+
+        k = {0: 1, 1: 2, 2: 3, 3: 1, 4: 2, 5: 3, 6: 4}[fid]
+        wpr_c = (n * k) // 32
+        for nb_val in nb_tuple:
+            max_t = 8 * nb_val
+            use_stream = nb_val >= 6
+            ha(
+                f"inline void umoe_v3_f{fid}_nb{nb_val}("
+                "const device half* xbase, const device uint* ecodes, const device half* escales, "
+                "threadgroup half* tg_x, const threadgroup half4* tg_ht4, const threadgroup half2* tg_ht2, "
+                f"{_fk._RTR_ARGS}const device half* lut_rtr4, "
+                "const threadgroup uint* tg_xrow, const threadgroup uint* tg_out_slot, device float* y, "
+                "uint rbase, uint m_rows, uint y_stride, uint cnt, uint tid, uint lane) {"
+            )
+            ha("    const uint tok_i = tid >> 3, vec_k = tid & 7u, vk_q = vec_k >> 1, vk_h = vec_k & 1u;")
+            ha("    const uint qid = lane / 4u, fm = (qid & 4u) + ((lane / 2u) % 4u), fn = (qid & 2u) * 2u + (lane % 2u) * 2u;")
+            ha("    const uint q = fn / 2u, r0 = rbase + fm;")
+            ha("    const device uint* p[RB];")
+            ha(f"    for (uint i = 0; i < RB; i++) p[i] = ecodes + (ulong)min(r0 + 8u * i, m_rows - 1u) * {wpr_c}u;")
+            ha(f"    const uint first = ({n}u - 8u - 8u * q) * {k}u, w_first = first >> 5, off = first & 31u;")
+            ha(f"    simdgroup_float8x8 Acc[RB][{nb_val}];")
+            ha(f"    for (uint i = 0; i < RB; i++) for (uint b = 0; b < {nb_val}u; b++) Acc[i][b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);")
+            if fid == 3:
+                ha("    uint w_prev[RB];")
+                ha(f"    for (uint i = 0; i < RB; i++) w_prev[i] = (w_first + 1u < {wpr_c}u) ? p[i][w_first + 1u] : 0u;")
+            _emit_x_load(max_t, "xbase", "0u", "0u")
+            ha("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            ha(f"    for (uint s = 0; s < {steps}u; s++) {{")
+            ha("        const uint cur_off = (s & 1u) * PING_STRIDE, nxt_off = ((s + 1u) & 1u) * PING_STRIDE;")
+            ha(f"        if (s + 1u < {steps}u) {{")
+            _emit_x_load(max_t, "xbase", "32u * (s + 1u)", "nxt_off")
+            ha("        }")
+            ha("        if (rbase < m_rows) {")
+            if not use_stream:
+                ha(f"            simdgroup_half8x8 Xm[{nb_val}][4];")
+                ha("            #pragma unroll")
+                ha(f"            for (uint b = 0; b < {nb_val}u; b++) {{")
+                ha("                #pragma unroll")
+                ha("                for (uint j = 0; j < 4u; j++) simdgroup_load(Xm[b][j], tg_x + cur_off + (8u * b) * XSTR + 8u * j, XSTR, ulong2(0, 0), true);")
+                ha("            }")
+                ha(f"            const uint wi = w_first - s * {k}u;")
+                ha("            #pragma unroll")
+                ha("            for (uint i = 0; i < RB; i++) {")
+                ha("                const device uint* pw = p[i] + wi; simdgroup_half8x8 Am;")
+                _emit_decode_am(
+                    fid,
+                    lambda j, expr: f"ELEMS_H2(Am.thread_elements()) = {expr};\n            #pragma unroll\n            for (uint b = 0; b < {nb_val}u; b++) simdgroup_multiply_accumulate(Acc[i][b], Am, Xm[b][{j}], Acc[i][b]);",
+                )
+                ha("            }")
+            else:
+                ha("            simdgroup_half8x8 Am[RB][4];")
+                ha(f"            const uint wi = w_first - s * {k}u;")
+                ha("            #pragma unroll")
+                ha("            for (uint i = 0; i < RB; i++) {")
+                ha("                const device uint* pw = p[i] + wi;")
+                _emit_decode_am(fid, lambda j, expr: f"ELEMS_H2(Am[i][{j}].thread_elements()) = {expr};")
+                ha("            }")
+                ha("            #pragma unroll")
+                ha(f"            for (uint b = 0; b < {nb_val}u; b++) {{")
+                ha("                #pragma unroll")
+                ha("                for (uint j = 0; j < 4u; j++) {")
+                ha("                    simdgroup_half8x8 Xm; simdgroup_load(Xm, tg_x + cur_off + (8u * b) * XSTR + 8u * j, XSTR, ulong2(0, 0), true);")
+                ha("                    #pragma unroll")
+                ha("                    for (uint i = 0; i < RB; i++) simdgroup_multiply_accumulate(Acc[i][b], Am[i][j], Xm, Acc[i][b]);")
+                ha("                }")
+                ha("            }")
+            ha("        }")
+            ha("        threadgroup_barrier(mem_flags::mem_threadgroup);")
+            ha("    }")
+            ha("    if (rbase < m_rows) {")
+            ha("        for (uint i = 0; i < RB; i++) {")
+            ha("            const uint row = r0 + 8u * i; if (row >= m_rows) continue;")
+            ha("            const float sc = (float)escales[row];")
+            ha("            #pragma unroll")
+            ha(f"            for (uint b = 0; b < {nb_val}u; b++) {{")
+            ha("                const uint ta = 8u * b + fn, tb = ta + 1u;")
+            ha("                const float2 d = ELEMS_F2(Acc[i][b].thread_elements()) * sc;")
+            ha("                if (ta < cnt) y[(ulong)tg_out_slot[ta] * y_stride + row] = d.x;")
+            ha("                if (tb < cnt) y[(ulong)tg_out_slot[tb] * y_stride + row] = d.y;")
+            ha("            }")
+            ha("        }")
+            ha("    }")
+            ha("}")
+
+    L = [
+        "const uint u = threadgroup_position_in_grid.x, rb_tg = threadgroup_position_in_grid.y;",
+        "if (u >= unit_count[0]) return;",
+        "const uint simd = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup, tid = simd * 32u + lane;",
+        "const uint m_rows = meta[0], x_div = meta[1];",
+        "const uint eid = units[u * 3u + 0u], base = units[u * 3u + 1u], cnt = units[u * 3u + 2u];",
+    ]
+    if n_rg > 1:
+        L += [
+            f"const uint rg_sz = m_rows / {n_rg}u, r_tg = rb_tg * (SG * 8u * RB), rg = r_tg / rg_sz;",
+            f"const uint rbase = (r_tg - rg * rg_sz) + simd * (8u * RB), m_grp = rg_sz, idx_rg = eid * {n_rg}u + rg;",
+            "const uint fid = exp_fid[idx_rg];",
+            "device float* y_ptr = y + rg * rg_sz;",
+        ]
+    else:
+        L += [
+            "const uint fid = exp_fid[eid], rbase = rb_tg * (SG * 8u * RB) + simd * (8u * RB), m_grp = m_rows;",
+            "device float* y_ptr = y;",
+        ]
+    L += [
+        "const device half4* t_ht1 = (const device half4*)lut_ht1; const device half4* t_ht2 = (const device half4*)lut_ht2;",
+        f"threadgroup half tg_x[{2 * max_tok_cap} * XSTR];",
+        "threadgroup half4 tg_lut_u[1024]; threadgroup half4* tg_ht4 = tg_lut_u; const threadgroup half2* tg_ht2 = (const threadgroup half2*)tg_lut_u;",
+        "threadgroup half* tg_rtr = (threadgroup half*)tg_lut_u; const threadgroup half* tv_rtr1 = tg_rtr; const threadgroup half* tv_rtr2 = tg_rtr; const threadgroup half* tv_rtr3 = tg_rtr;",
+        f"threadgroup uint tg_xrow[{max_tok_cap}], tg_out_slot[{max_tok_cap}];",
+    ]
+    if has_ht:
+        L += [
+            f"if (fid == 0u) {{ for (uint idx = tid; idx < 512u; idx += {sg * 32}u) tg_ht4[idx] = t_ht1[idx]; }}",
+            f"else if (fid == 1u) {{ for (uint idx = tid; idx < 512u; idx += {sg * 32}u) tg_ht4[idx] = t_ht2[idx]; }}",
+            f"else if (fid == 2u) {{ for (uint idx = tid; idx < 512u; idx += {sg * 32}u) tg_ht4[idx] = ((const device half4*)lut_ht3)[idx]; }}",
+        ]
+    if has_rtr:
+        L += [
+            f"if (fid >= 3u && fid <= 5u) {{ const device half* t = (fid == 3u) ? lut_rtr1 : (fid == 4u) ? lut_rtr2 : lut_rtr3; for (uint idx = tid; idx < 4096u; idx += {sg * 32}u) tg_rtr[idx] = t[idx]; }}",
+        ]
+    if has_nv:
+        L += [
+            "threadgroup half tg_e2m1[16]; threadgroup half tg_e4m3[256];",
+            f"if (fid == 7u) {{ if (tid < 16u) tg_e2m1[tid] = lut_e2m1[tid]; for (uint idx = tid; idx < 256u; idx += {sg * 32}u) tg_e4m3[idx] = lut_e4m3[idx]; }}",
+        ]
+    L.append(
+        "if (tid < cnt) { const uint os = slot_order[base + tid]; tg_out_slot[tid] = "
+        + ("base + tid;" if sorted_out else "os;")
+        + " tg_xrow[tid] = "
+        + ("base + tid;" if sorted_in else "(x_div == 1u) ? os : (os >> 3);")
+        + " }"
+    )
+    L.append("threadgroup_barrier(mem_flags::mem_threadgroup);")
+    xbase_expr = "((fid == 7u) ? x_raw : x)" if has_nv else "x"
+    idx_expr = "idx_rg" if n_rg > 1 else "eid"
+    L.append(f"const device uint* ec = codes + exp_code_off[{idx_expr}]; const device half* es = scales + exp_scale_off[{idx_expr}];")
+    L.append("switch (fid) {")
+    for fid in fids:
+        L.append(f"    case {fid}u:")
+        if fid == 7:
+            L.append("        { const device uchar* env_s = nv_scales + exp_nv_scale_off[eid]; const float eout = nv_outer[eid];")
+            for nb_v in nb_tuple[:-1]:
+                kw = "if" if nb_v == 1 else "else if"
+                L.append(f"          {kw} (cnt <= {8 * nb_v}u) umoe_v3_f7_nb{nb_v}({xbase_expr}, ec, env_s, eout, tg_x, tg_e2m1, tg_e4m3, tg_xrow, tg_out_slot, y_ptr, rbase, m_grp, m_rows, cnt, tid, lane);")
+            L.append(f"          else umoe_v3_f7_nb{max_nb}({xbase_expr}, ec, env_s, eout, tg_x, tg_e2m1, tg_e4m3, tg_xrow, tg_out_slot, y_ptr, rbase, m_grp, m_rows, cnt, tid, lane); }}")
+        else:
+            for nb_v in nb_tuple[:-1]:
+                kw = "if" if nb_v == 1 else "else if"
+                L.append(f"        {kw} (cnt <= {8 * nb_v}u) umoe_v3_f{fid}_nb{nb_v}({xbase_expr}, ec, es, tg_x, tg_ht4, tg_ht2, tv_rtr1, tv_rtr2, tv_rtr3, lut_rtr4, tg_xrow, tg_out_slot, y_ptr, rbase, m_grp, m_rows, cnt, tid, lane);")
+            L.append(f"        else umoe_v3_f{fid}_nb{max_nb}({xbase_expr}, ec, es, tg_x, tg_ht4, tg_ht2, tv_rtr1, tv_rtr2, tv_rtr3, lut_rtr4, tg_xrow, tg_out_slot, y_ptr, rbase, m_grp, m_rows, cnt, tid, lane);")
+        L.append("        break;")
+    L.append("}")
+    in_names = ["x", "codes", "scales", "exp_fid", "exp_code_off", "exp_scale_off", "lut_ht1", "lut_ht2", "lut_ht3", "lut_rtr1", "lut_rtr2", "lut_rtr3", "lut_rtr4", "units", "unit_count", "meta", "slot_order"]
+    if has_nv:
+        in_names += ["x_raw", "nv_scales", "exp_nv_scale_off", "nv_outer", "lut_e2m1", "lut_e4m3"]
+    tag = "_".join(str(f) for f in fids)
+    return mx.fast.metal_kernel(
+        name=f"ink_umoe_prefill_v3_n{n}_f{tag}_si{int(sorted_in)}_so{int(sorted_out)}_rb{rb}_s{sg}_rg{n_rg}_mnb{max_nb}",
+        input_names=in_names,
+        output_names=["y"],
+        header="\n".join(H),
+        source="\n".join(L),
+    )
+
+
 # --------------------------------------------------------------------------- O(N) Global KV Allocation & M4 Pro Tuning
 
 
@@ -1498,7 +1858,102 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
     _model_mod.logits_to_probs = fast_logits_to_probs
     _gen_mod.logits_to_probs = fast_logits_to_probs
 
-    # 2d. Enable lossless N-gram speculative drafting by default in stream_dspark (opt out via LAMQ_NGRAM=0)
+    # 2c-bis. Clamp mx.set_wired_limit inside stream_dspark / stream_serial (generate.py:714 sets it to max_rec=19.07 GB!)
+    orig_set_wired_limit = mx.set_wired_limit
+    max_rec = int(mx.device_info().get("max_recommended_working_set_size", 0) or 0)
+    safe_wire_cap = (max_rec - (6 << 30)) if max_rec <= (24 << 30) else (max_rec - (4 << 30))
+
+    def _clamped_set_wired_limit(limit: int) -> int:
+        if limit > 0 and safe_wire_cap > 0 and limit > safe_wire_cap:
+            limit = safe_wire_cap
+        return orig_set_wired_limit(limit)
+
+    mx.set_wired_limit = _clamped_set_wired_limit
+
+    # 2d. Enable lossless N-gram speculative drafting by default in stream_dspark (opt out via LAMQ_NGRAM=0),
+    #     with cross-turn incremental O(delta) NgramDraftIndex reuse, EOS commit trimming, and
+    #     Post-Generation KV Cache Promotion (SGLang RadixAttention / vLLM style full-turn KV reuse).
+    orig_commit_spec = _model_mod.Inkling2Cache.commit_spec_verify
+    orig_commit_tree = _model_mod.Inkling2Cache.commit_tree_verify
+    orig_push_context = _drafter_mod.DSparkDrafterMLX.push_context
+
+    def _trimmed_commit_spec_verify(self, k_accept: int, block_len: int):
+        trim = getattr(self, "_trim_commit_to", None)
+        if trim is not None:
+            self._trim_commit_to = None
+            k_accept = max(1, min(int(k_accept), int(trim)))
+        return orig_commit_spec(self, k_accept, block_len)
+
+    def _trimmed_commit_tree_verify(self, accepted_path: list[int], block_len: int):
+        trim = getattr(self, "_trim_commit_to", None)
+        if trim is not None:
+            self._trim_commit_to = None
+            accepted_path = list(accepted_path[: max(1, int(trim))])
+        return orig_commit_tree(self, accepted_path, block_len)
+
+    def _trimmed_push_context(self, target_taps: mx.array, start_pos: int):
+        trim = getattr(self, "_trim_push_to", None)
+        if trim is not None:
+            self._trim_push_to = None
+            t_keep = max(1, min(int(target_taps.shape[0]), int(trim)))
+            target_taps = target_taps[:t_keep]
+        return orig_push_context(self, target_taps, start_pos)
+
+    _model_mod.Inkling2Cache.commit_spec_verify = _trimmed_commit_spec_verify
+    _model_mod.Inkling2Cache.commit_tree_verify = _trimmed_commit_tree_verify
+    _drafter_mod.DSparkDrafterMLX.push_context = _trimmed_push_context
+
+    _stream_tls = threading.local()
+    orig_ngram_cls = _gen_mod.NgramDraftIndex
+
+    class _CachedNgramDraftIndex(orig_ngram_cls):
+        """NgramDraftIndex with O(delta) cross-turn reuse and EOS commit-boundary trimming."""
+
+        def __init__(self, initial_tokens=()):
+            ctx = getattr(_stream_tls, "ctx", None)
+            pc = ctx.get("prompt_cache") if isinstance(ctx, dict) else None
+            reused = (
+                pc.acquire_ngram_index(initial_tokens)
+                if (pc is not None and hasattr(pc, "acquire_ngram_index"))
+                else None
+            )
+            if reused is not None:
+                self.tokens = reused.tokens
+                self._t3 = reused._t3
+                self._t4 = reused._t4
+                self._t5 = reused._t5
+                self.tables = reused.tables
+                self._indexed_end = reused._indexed_end
+                self._cursor = None
+                self._last_hit = None
+                self._has_tombstones = reused._has_tombstones
+            else:
+                super().__init__(initial_tokens)
+            self._eos_ids = ctx.get("eos_ids", frozenset((200006,))) if isinstance(ctx, dict) else frozenset((200006,))
+            self._prompt_cache = pc
+            if isinstance(ctx, dict):
+                ctx["ngram_idx"] = self
+
+        def observe(self, raw, k_match: int, block_size: int, was_ngram: bool) -> None:
+            if raw and self._eos_ids:
+                for idx, tok in enumerate(raw):
+                    if tok in self._eos_ids:
+                        if idx + 1 < len(raw):
+                            keep = idx + 1
+                            raw = list(raw[:keep])
+                            k_match = min(k_match, keep - 1)
+                            pc = self._prompt_cache
+                            ag = getattr(pc, "_active_gen", None) if pc is not None else None
+                            if isinstance(ag, dict):
+                                if ag.get("cache") is not None:
+                                    ag["cache"]._trim_commit_to = keep
+                                if ag.get("drafter") is not None:
+                                    ag["drafter"]._trim_push_to = keep
+                        break
+            super().observe(raw, k_match, block_size, was_ngram)
+
+    _gen_mod.NgramDraftIndex = _CachedNgramDraftIndex
+
     ngram_enabled = os.environ.get("LAMQ_NGRAM", "1") != "0"
     if ngram_enabled:
         orig_stream_dspark = _gen_mod.stream_dspark
@@ -1506,10 +1961,179 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         def _ngram_stream_dspark(*args, **kwargs):
             kwargs.setdefault("ngram", True)
             kwargs.setdefault("ngram_min_match", 5)
-            return orig_stream_dspark(*args, **kwargs)
+            pc = kwargs.get("prompt_cache")
+            eos_set = frozenset(int(x) for x in (kwargs.get("eos_ids") or (200006,)))
+            ctx = {"prompt_cache": pc, "ngram_idx": None, "eos_ids": eos_set}
+            _stream_tls.ctx = ctx
+            gen = orig_stream_dspark(*args, **kwargs)
+            try:
+                for chunk in gen:
+                    ng = ctx.get("ngram_idx")
+                    if (
+                        pc is not None
+                        and ng is not None
+                        and hasattr(pc, "checkpoint_pre_tool_gen")
+                        and (200049 in chunk)
+                    ):
+                        pc.checkpoint_pre_tool_gen(ng)
+                    yield chunk
+            finally:
+                try:
+                    gen.close()
+                finally:
+                    ng = ctx.get("ngram_idx")
+                    if pc is not None and ng is not None and hasattr(pc, "finalize_post_gen"):
+                        pc.finalize_post_gen(ng)
+                    _stream_tls.ctx = None
 
         _gen_mod.stream_dspark = _ngram_stream_dspark
         _inkling_mod.stream_dspark = _ngram_stream_dspark
+
+    # 2e. Low-memory prefill guard for large quant variants (e.g. 12.8GB on 24 GB Unified Memory):
+    #     When active Metal memory exceeds 12 GiB during a T >= 64 prefill chunk, skip holding all 12
+    #     loop layers' dequantized FP16 QKV & O matrices simultaneously (+645 MB) and flush async_eval
+    #     every 2 visits instead of 4 (-400 MB peak graph activations), cutting peak prefill RAM by >1 GB
+    #     with bit-for-bit identical output (max_diff == 0.0).
+    orig_forward_core_fast = _model_mod.Inkling2LoopPackedMLX._forward_core_fast
+    _low_mem_thresh = int(float(os.environ.get("LAMQ_LOW_MEM_THRESHOLD_GB", "14.5")) * (1 << 30))
+
+    def _adaptive_forward_core_fast(
+        self,
+        input_ids,
+        cache,
+        all_logits: bool = False,
+        argmax_only: bool = False,
+        ordered_only: bool = False,
+        tap_visits: tuple[int, ...] = (),
+        tree_spec: dict | None = None,
+        skip_logits: bool = False,
+    ):
+        n_tok = len(input_ids) if isinstance(input_ids, (list, tuple)) else int(input_ids.shape[-1])
+        force_low = os.environ.get("LAMQ_LOW_MEM_PREFILL") == "1"
+        if n_tok < 64 or (not force_low and mx.get_active_memory() <= _low_mem_thresh):
+            return orig_forward_core_fast(
+                self,
+                input_ids,
+                cache,
+                all_logits=all_logits,
+                argmax_only=argmax_only,
+                ordered_only=ordered_only,
+                tap_visits=tap_visits,
+                tree_spec=tree_spec,
+                skip_logits=skip_logits,
+            )
+        cfg = self.cfg
+        h = self.embed(input_ids)[0]  # [T, 2304]
+        T = int(h.shape[0])
+        q_pos0 = cache.seq_len
+        blocks_cat: mx.array | None = None
+        n_blocks = 0
+        tap_set = set(tap_visits)
+        captured: dict[int, mx.array] = {}
+        visit = 0
+
+        for i in range(cfg.loop_start):
+            if visit in tap_set:
+                captured[visit] = h
+            L = self.layers[i]
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
+            if L.is_block_boundary:
+                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                n_blocks += 1
+            h = new_h
+            visit += 1
+            if (visit & 3) == 0:
+                mx.async_eval(h)
+
+        pre_loop_h = h
+        pre_loop_blocks = blocks_cat
+        num_pre = n_blocks
+
+        for i in range(cfg.loop_start, cfg.loop_end):
+            if visit in tap_set:
+                captured[visit] = h
+            L = self.layers[i]
+            new_h = L.forward_fast(
+                h, blocks_cat, n_blocks, q_pos0, T, cache, i,
+                messages=None, tree_spec=tree_spec, qkv_w_cached=None, o_w_cached=None,
+            )
+            if L.is_block_boundary:
+                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                n_blocks += 1
+            h = new_h
+            visit += 1
+            if (visit & 3) == 0:
+                mx.async_eval(h)
+
+        num_loop = cfg.loop_end - cfg.loop_start
+        for loop_idx in range(1, cfg.loop_passes):
+            prev_n = n_blocks - (num_pre + 1)
+            prev_blocks = blocks_cat[num_pre + 1 :] if prev_n > 0 else None
+            prev_h = h
+            h = pre_loop_h
+            blocks_cat = pre_loop_blocks
+            n_blocks = num_pre
+            cache_offset = cfg.num_hidden_layers + (loop_idx - 1) * num_loop - cfg.loop_start
+            for loop_layer_idx, i in enumerate(range(cfg.loop_start, cfg.loop_end)):
+                if visit in tap_set:
+                    captured[visit] = h
+                L = self.layers[i]
+                msgs = _model_mod.block_attn_res_fused(self.message_in_q[loop_layer_idx], prev_blocks, prev_n, prev_h)
+                new_h = L.forward_fast(
+                    h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset,
+                    messages=msgs, tree_spec=tree_spec, qkv_w_cached=None, o_w_cached=None,
+                )
+                if L.is_block_boundary:
+                    blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                    n_blocks += 1
+                h = new_h
+                visit += 1
+                if (visit & 3) == 0:
+                    mx.async_eval(h)
+
+        for i in range(cfg.loop_end, cfg.num_hidden_layers):
+            if visit in tap_set:
+                captured[visit] = h
+            L = self.layers[i]
+            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
+            if L.is_block_boundary:
+                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                n_blocks += 1
+            h = new_h
+            visit += 1
+            if (visit & 3) == 0 and visit < 48:
+                mx.async_eval(h)
+
+        if skip_logits:
+            if visit in tap_set:
+                h = _model_mod.block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]
+                captured[visit] = h
+            cache.seq_len += T
+            if tap_visits:
+                taps = mx.stack([captured[v] for v in tap_visits], axis=1)
+                return h, cache, taps
+            return h, cache
+        if not all_logits and visit not in tap_set and T > 1:
+            b_last = blocks_cat[:, -1:, :] if (blocks_cat is not None and n_blocks > 0) else blocks_cat
+            h_in = _model_mod.block_attn_res_fused(self.final_in_q, b_last, n_blocks, h[-1:, :], norm_w=self.final_norm_w)[0][None, :, :]
+        else:
+            h = _model_mod.block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]
+            if visit in tap_set:
+                captured[visit] = h
+            h_in = h[None, :, :] if all_logits else h[-1:, :][None, :, :]
+        cache.seq_len += T
+        if argmax_only:
+            out = self.lm_head.argmax(h_in)
+        elif ordered_only:
+            out = self.lm_head.ordered_logits(h_in)
+        else:
+            out = self.lm_head(h_in)
+        if tap_visits:
+            taps = mx.stack([captured[v] for v in tap_visits], axis=1)
+            return out, cache, taps
+        return out, cache
+
+    _model_mod.Inkling2LoopPackedMLX._forward_core_fast = _adaptive_forward_core_fast
 
     # 3. 16+ core M4 Pro / M4 Max grid tuning (overrides base 10-core M4 defaults only on g16s/c/d)
     m4_pro = is_m4_pro_or_max()
@@ -1589,16 +2213,17 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                     output_shapes=[(n_slots, self.m_rows)],
                     output_dtypes=[mx.float32],
                 )[0]
-            # Prefill (non-MPP): sg_p=4 beats sg_p=8 by 1.24x at T<=320 (and for DN at all T)
-            if not _fk._has_mpp() and (n_slots <= 2560 or self.n_cols < 2304):
+            # Prefill (non-MPP): Lean-SRAM Union-LUT MoE Prefill v3 (12.9/15.1 KB SRAM -> 2 TGs/core + nb=1..6 + sg=4 at all T)
+            if not _fk._has_mpp():
                 offsets, order = sorted_cache if sorted_cache is not None else _fk.compute_moe_sorted_offsets(eids_flat)
-                tile_t = 32
+                max_nb = 6 if n_slots > 2048 else 4
+                tile_t = 8 * max_nb
                 units, ucnt, max_u = _fk.plan_moe_prefill_units(offsets, self.exp_fid, self.fids, n_slots, tile_t=tile_t)
                 sg_p, rb_p = 4, 2
                 rows_per_tg = sg_p * 8 * rb_p
                 rblocks = (self.m_rows + rows_per_tg - 1) // rows_per_tg
-                kern = _fk._make_unified_moe_prefill_v2_kernel(
-                    self.n_cols, self.fids, sorted_in=sorted_in, sorted_out=sorted_out, sg=sg_p, rb=rb_p, n_rg=self.n_rg,
+                kern = make_fast_moe_prefill_v3_kernel(
+                    self.n_cols, self.fids, sorted_in=sorted_in, sorted_out=sorted_out, sg=sg_p, rb=rb_p, n_rg=self.n_rg, max_nb=max_nb,
                 )
                 return kern(
                     inputs=[x_rot_f16.reshape(-1), self.codes, self.scales, self._kern_fid, self.exp_code_off, self.exp_scale_off, *self._lut_args_prefill_v2, units, ucnt, _fk._u32(self.m_rows, x_div), order, *nv_tail],

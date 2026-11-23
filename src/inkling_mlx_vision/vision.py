@@ -400,8 +400,10 @@ def encode_single_image(img: PreprocessedImage, w: dict[str, mx.array]) -> mx.ar
         mlp = mlp @ w[f"{p}.mlp.c_proj.weight"].T + w[f"{p}.mlp.c_proj.bias"]
 
         h = residual + w[f"{p}.ls_2.gamma"] * mlp
-        if (i + 1) % 4 == 0:
-            mx.async_eval(h)
+        # Evaluate layer-by-layer so only 1 layer's activations stay live in Metal RAM.
+        mx.eval(h)
+        if (i + 1) % 8 == 0:
+            mx.clear_cache()
 
     patch_states = h[1:].reshape(n_tok, MERGE_SIZE * MERGE_SIZE * HIDDEN_SIZE)  # [n_tok, 4096]
     merged = patch_states @ w["vision_tower.proj_in.weight"].T  # [n_tok, 4096]
@@ -413,12 +415,24 @@ def encode_single_image(img: PreprocessedImage, w: dict[str, mx.array]) -> mx.ar
 
 
 def encode_images(images: list[PreprocessedImage], weights_path: str | Path) -> list[mx.array]:
-    """Load vision weights lazily via mmap, encode all images, and immediately release weights."""
+    """Load vision weights lazily via mmap, encode all images, and immediately release weights.
+
+    Automatically falls back to MLX CPU stream if Metal reports OutOfMemory under tight 24 GB RAM pressure.
+    """
     if not images:
         return []
+    mx.clear_cache()
     weights = mx.load(str(weights_path))
     try:
-        return [encode_single_image(img, weights) for img in images]
+        try:
+            return [encode_single_image(img, weights) for img in images]
+        except RuntimeError as e:
+            msg = str(e)
+            if "OutOfMemory" not in msg and "Insufficient Memory" not in msg:
+                raise
+            mx.clear_cache()
+            with mx.stream(mx.cpu):
+                return [encode_single_image(img, weights) for img in images]
     finally:
         del weights
         mx.clear_cache()

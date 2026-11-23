@@ -268,3 +268,82 @@ def test_exact_radix_topp_parity(shape: tuple[int, ...], scale: float, temp: flo
     diff = np.abs(g - r)
     assert float(diff.max()) < 1e-5
     assert float(np.sqrt(np.mean(diff * diff))) < 1e-7
+
+
+@pytest.mark.parametrize("sg", [8, 4])
+def test_fast_moe_prefill_v3_parity(sg: int):
+    """Bit-exact parity of Lean-SRAM Union-LUT MoE Prefill v3 across nb_val in (1..6) and fid in (0, 3)."""
+    rng = np.random.default_rng(1234 + sg)
+    # 6 experts exercising cnt in {1..8}, {9..16}, {17..24}, {25..32}, {33..40}, {41..48} and both HT (fid=0) & RTR (fid=3)
+    counts = [6, 15, 21, 29, 37, 45]
+    n_slots = sum(counts)
+    n_cols = 256
+    m_rows = 128
+
+    x_rot = mx.array((rng.standard_normal((n_slots, n_cols)) * 0.5).astype(np.float16))
+    codes = mx.array(rng.integers(0, 65536, size=(98304,), dtype=np.uint32))
+    scales = mx.array((rng.uniform(0.05, 0.5, size=(24576,))).astype(np.float16))
+    exp_fid = mx.array([0, 3, 0, 3, 0, 3], dtype=mx.uint8)
+    exp_code_off = mx.array([i * 8192 for i in range(6)], dtype=mx.uint32)
+    exp_scale_off = mx.array([i * 2048 for i in range(6)], dtype=mx.uint32)
+    lut_ht1 = mx.array((rng.standard_normal((512, 4)) * 0.25).astype(np.float16))
+    lut_ht2 = mx.array((rng.standard_normal((512, 4)) * 0.25).astype(np.float16))
+    lut_ht3 = mx.array((rng.standard_normal((512, 4)) * 0.25).astype(np.float16))
+    lut_rtr1 = mx.array((rng.standard_normal((256, 16)) * 0.25).astype(np.float16))
+    lut_rtr2 = mx.array((rng.standard_normal((256, 16)) * 0.25).astype(np.float16))
+    lut_rtr3 = mx.array((rng.standard_normal((256, 16)) * 0.25).astype(np.float16))
+    lut_rtr4 = mx.array((rng.standard_normal((65536,)) * 0.25).astype(np.float16))
+
+    ref_units_list = []
+    got_units_list = []
+    cur = 0
+    for e, c in enumerate(counts):
+        got_units_list.extend([e, cur, c])
+        rem = c
+        off = cur
+        while rem > 0:
+            step_c = min(rem, 32)
+            ref_units_list.extend([e, off, step_c])
+            off += step_c
+            rem -= step_c
+        cur += c
+    ref_units = mx.array(ref_units_list, dtype=mx.uint32)
+    ref_ucnt = mx.array([len(ref_units_list) // 3], dtype=mx.uint32)
+    got_units = mx.array(got_units_list, dtype=mx.uint32)
+    got_ucnt = mx.array([len(got_units_list) // 3], dtype=mx.uint32)
+    meta = _fk._u32(m_rows, 8)
+    slot_order = mx.arange(n_slots, dtype=mx.uint32)
+
+    common = [
+        x_rot.reshape(-1), codes, scales, exp_fid, exp_code_off, exp_scale_off,
+        lut_ht1, lut_ht2, lut_ht3, lut_rtr1, lut_rtr2, lut_rtr3, lut_rtr4,
+    ]
+    mx.eval(*common, ref_units, ref_ucnt, got_units, got_ucnt, meta, slot_order)
+
+    fids = (0, 3)
+    # Stock v2 reference uses sg=8, tile_t=32
+    ref_k = _fk._make_unified_moe_prefill_v2_kernel(n_cols, fids, sg=8, rb=2)
+    got_k = accel.make_fast_moe_prefill_v3_kernel(n_cols, fids, sg=sg, rb=2, max_nb=6)
+    ref_max_u = len(ref_units_list) // 3
+    got_max_u = len(got_units_list) // 3
+    ref_rblocks = (m_rows + 8 * 8 * 2 - 1) // (8 * 8 * 2)
+    got_rblocks = (m_rows + sg * 8 * 2 - 1) // (sg * 8 * 2)
+
+    ref = ref_k(
+        inputs=[*common, ref_units, ref_ucnt, meta, slot_order],
+        grid=(ref_max_u * 8 * 32, ref_rblocks, 1),
+        threadgroup=(8 * 32, 1, 1),
+        output_shapes=[(n_slots, m_rows)],
+        output_dtypes=[mx.float32],
+    )[0]
+    got = got_k(
+        inputs=[*common, got_units, got_ucnt, meta, slot_order],
+        grid=(got_max_u * sg * 32, got_rblocks, 1),
+        threadgroup=(sg * 32, 1, 1),
+        output_shapes=[(n_slots, m_rows)],
+        output_dtypes=[mx.float32],
+    )[0]
+    mx.eval(ref, got)
+    diff = np.max(np.abs(np.asarray(ref, dtype=np.float32) - np.asarray(got, dtype=np.float32)))
+    assert diff == 0.0, f"MoE prefill v3 (sg={sg}, max_nb=6) max_diff={diff}"
+

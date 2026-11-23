@@ -2,15 +2,20 @@
 set -euo pipefail
 
 # Portable launcher for inkling-mlx-serve (override defaults via env vars or CLI flags).
-MODEL="${INKLING_MODEL:-shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-8.9GB}"
+MODEL_VARIANT="${MODEL_VARIANT:-8.9GB}"
+MODEL="${INKLING_MODEL:-shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-${MODEL_VARIANT}}"
 DRAFTER="${INKLING_DRAFTER:-shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter}"
 VISION="${INKLING_VISION:-./vision_tower.safetensors}"
 HOST="${INKLING_HOST:-127.0.0.1}"
 PORT="${INKLING_PORT:-8080}"
 CONTEXT="${INKLING_CONTEXT:-131072}"
 MAX_TOKENS="${INKLING_MAX_TOKENS:-16384}"
-PREFILL_CHUNK="${INKLING_PREFILL_CHUNK:-256}"
-PROMPT_CACHE="${INKLING_PROMPT_CACHE:-3}"
+PREFILL_CHUNK="${INKLING_PREFILL_CHUNK:-512}"
+if [[ "${MODEL_VARIANT}" == "12.8GB" || "${MODEL}" == *"12.8GB"* ]]; then
+  PROMPT_CACHE="${INKLING_PROMPT_CACHE:-2}"
+else
+  PROMPT_CACHE="${INKLING_PROMPT_CACHE:-3}"
+fi
 MODEL_ID="${INKLING_MODEL_ID:-inkling-2-mini}"
 
 RESTART=0

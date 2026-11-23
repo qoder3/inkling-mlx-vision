@@ -229,8 +229,8 @@ def make_queued_handler_factory(orig_make_handler, log_fn: Callable[[str], None]
                     log_fn(f"[queue] #{ticket} client disconnected; stopped")
                     self.close_connection = True
                 except Exception:
-                    traceback.print_exc()
-                    log_fn(f"[err] #{ticket} internal server error (see stderr traceback)")
+                    tb = traceback.format_exc().rstrip()
+                    log_fn(f"[err] #{ticket} internal server error:\n{tb}")
                     try:
                         done_evt.set()
                         if ka.ident is not None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import sys
@@ -30,6 +31,8 @@ class ServerConfig:
     pin_min_tokens: int = 4096
     loop_guard: bool = True
     metal_accel: bool = True
+    keep_wired: bool = True
+    max_reasoning_effort: str | None = None
     log_file: Path | None = None
 
 
@@ -217,6 +220,11 @@ def parse_extra_args(argv: list[str]) -> tuple[ServerConfig, list[str]]:
         elif a == "--no-metal-accel":
             cfg.metal_accel = False
             i += 1
+        elif a == "--no-keep-wired":
+            cfg.keep_wired = False
+            i += 1
+        elif a == "--max-reasoning-effort" or a.startswith("--max-reasoning-effort="):
+            cfg.max_reasoning_effort = take_val("--max-reasoning-effort").strip().lower() or None
         elif a == "--log-file" or a.startswith("--log-file="):
             cfg.log_file = Path(take_val("--log-file")).expanduser()
         else:
@@ -281,7 +289,16 @@ def install_patches(cfg: ServerConfig) -> None:
             log_fn(f"[prefill] start {n} new tok (pos {pos0}..{pos0 + n}) | chunk={step}")
         while True:
             t_chunk = time.perf_counter()
-            end = min(start + step, n)
+            act_mem = mx.get_active_memory()
+            if act_mem > int(15.2 * (1 << 30)):
+                cur_step = min(step, 256)
+            elif act_mem > int(14.2 * (1 << 30)):
+                cur_step = min(step, 512)
+            elif step >= 512 and (n - start) >= 1024:
+                cur_step = max(step, 1024)
+            else:
+                cur_step = step
+            end = min(start + cur_step, n)
             last = end >= n
             if last and output_head:
                 fwd = m.forward_ordered_logits if ordered else m.forward_argmax
@@ -299,6 +316,13 @@ def install_patches(cfg: ServerConfig) -> None:
                 if vctx is not None:
                     vctx["chunk_pos0"] = None
             if last:
+                if not output_head:
+                    last_pending = list(cache.state)
+                    if taps is not None:
+                        last_pending.append(taps)
+                    mx.eval(*last_pending)
+                    if mx.get_active_memory() > (12 << 30):
+                        mx.clear_cache()
                 if n > step:
                     elapsed = max(time.perf_counter() - t_total, 1e-9)
                     log_fn(
@@ -315,6 +339,8 @@ def install_patches(cfg: ServerConfig) -> None:
                     x for x in (*drafter.ctx_k, *drafter.ctx_v, drafter.f_rnn) if x is not None
                 )
             mx.eval(*pending)
+            if (mx.get_active_memory() + mx.get_cache_memory()) > (16 << 30):
+                mx.clear_cache()
             dt = max(time.perf_counter() - t_chunk, 1e-9)
             chunk_n = end - start
             log_fn(
@@ -347,6 +373,18 @@ def install_patches(cfg: ServerConfig) -> None:
             log_fn(f"vision enabled: {cfg.vision_path} ({sz_mb:.1f} MB BF16, lazy on-demand mmap)")
         else:
             log_fn("vision disabled (pass --vision /path/to/vision_tower.safetensors to enable)")
+        if cfg.keep_wired:
+            max_rec = int(mx.device_info().get("max_recommended_working_set_size", 0) or 0)
+            if max_rec > 0:
+                active = int(mx.get_active_memory())
+                safe_wire_cap = max_rec - (6 << 30) if max_rec <= (24 << 30) else max_rec - (4 << 30)
+                target_wire = max(0, min(active + (2 << 30), safe_wire_cap))
+                mx.set_wired_limit(target_wire)
+                atexit.register(lambda: mx.set_wired_limit(0))
+                log_fn(
+                    f"wired memory pinned: {target_wire / 1e9:.2f} GB "
+                    f"(active {active / 1e9:.2f} GB, max_rec {max_rec / 1e9:.2f} GB)"
+                )
 
     _server.Engine._load = _instrumented_load
 
@@ -369,6 +407,26 @@ def install_patches(cfg: ServerConfig) -> None:
             effort = _server._number(
                 {"reasoning_effort": effort}, "reasoning_effort", self.args.reasoning_effort, low=0, high=0.99
             )
+        if (
+            cfg.max_reasoning_effort in _server.EFFORTS
+            and isinstance(effort, str)
+            and effort in _server.EFFORTS
+            and _server.EFFORTS.index(effort) > _server.EFFORTS.index(cfg.max_reasoning_effort)
+        ):
+            effort = cfg.max_reasoning_effort
+
+        loop_guard_info = None
+        if tokenize and cfg.loop_guard:
+            loop_guard_info = _parser_mod.detect_agent_tool_loop(messages)
+            if loop_guard_info is not None:
+                messages = _parser_mod.inject_tool_loop_reminder(messages, loop_guard_info)
+                log_fn(
+                    f"[loop-guard] agent tool loop detected ({loop_guard_info['tool_name']}, "
+                    f"exact={loop_guard_info['exact_streak']}, stagnant={loop_guard_info['stagnant_streak']}); "
+                    f"injected reminder"
+                    + (" + hard circuit-breaker armed" if (loop_guard_info["hard_block_sig"] or loop_guard_info["hard_block_tool"]) else "")
+                )
+
         add_prompt = req.get("add_generation_prompt", True)
         if type(add_prompt) is not bool:
             raise _server.RequestError(400, "add_generation_prompt must be a boolean")
@@ -398,13 +456,13 @@ def install_patches(cfg: ServerConfig) -> None:
                 except Exception:
                     pin_hint = None
 
-        return rendered, effort, tool_names, images_raw, pin_hint
+        return rendered, effort, tool_names, images_raw, pin_hint, loop_guard_info
 
     def _render_with_vision(self, req: dict) -> str:
         return self._apply_template_with_vision(req, tokenize=False)[0]
 
     def _prepare_with_vision(self, req: dict) -> dict:
-        enc, effort, tool_names, images_raw, pin_hint = self._apply_template_with_vision(
+        enc, effort, tool_names, images_raw, pin_hint, loop_guard_info = self._apply_template_with_vision(
             dict(req, add_generation_prompt=True), tokenize=True
         )
         if isinstance(enc, dict) or hasattr(enc, "input_ids"):
@@ -487,6 +545,7 @@ def install_patches(cfg: ServerConfig) -> None:
             "cache_ids": cache_ids,
             "images_plan": images_plan,
             "pin_hint": pin_hint,
+            "loop_guard": loop_guard_info,
             "effort": effort,
             "tool_names": tool_names,
             "max_tokens": min(max_tokens, ctx - len(ids)),
@@ -531,9 +590,11 @@ def install_patches(cfg: ServerConfig) -> None:
             "encoded_spans": None,
             "chunk_pos0": None,
         }
+        _parser_mod.set_active_loop_guard(job.get("loop_guard"))
         try:
             return orig_run(self, job, wrapped_emit, gone)
         finally:
+            _parser_mod.set_active_loop_guard(None)
             self.m._vision_ctx = None
 
     _server.Engine._run = _instrumented_run
