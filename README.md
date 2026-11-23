@@ -64,7 +64,7 @@ Out of the box, `lookatmyquant`'s `lamq serve` already delivered remarkable comp
    - **Exact 3-Pass Radix-Histogram `top_p` Metal Kernel:** eliminates 200K/32K `mx.argsort` on every `temp > 0, top_p < 1` round — **5.7× faster** (`2.36 ms → 0.42 ms`, `rmse = 7.2e-11`) with zero CPU sync, plus lossless `NgramDraftIndex` (`min_match=5`) enabled by default with **incremental `O(delta)` cross-turn reuse**.
    - **Exact SpecInfer Stochastic Tree Verification (`spec.py`, `LAMQ_STOCHASTIC_TREE=auto`):** unlocks 8-node `"4-3"` tree verification at `temp > 0, top_p < 1` via sequential-residual multi-draft rejection sampling with without-replacement root splitting (`q_b1 = norm(q_a1 · 1[x ≠ a1])`), running the entire tree walk on GPU so the `[200,058]` residual categorical draw executes only **once** (`1.32 ms` vs `1.39 ms` for 1D verify — strictly higher acceptance at lower latency, 100% unbiased target distribution). Adapts dynamically between `"4-3"` stochastic tree (`ewma < 3.6`) and 8-token chains (`ewma ≥ 3.6`).
    - **Hybrid `N-Gram / Token Recycling || DSpark` Split-Source Tree (`spec.py`):** fuses medium-confidence 3/4-gram matches or verified per-session `TokenRecycler` bigrams onto Branch A (`nodes 1..4`) while DSpark populates Branch B (`nodes 5..7`, only 3 drafter head calls) — verifying both in a single 8-node tree forward pass, with optional DSpark Markov-state carryover (`LAMQ_MARKOV_CARRY=1`).
-   - **Lean-SRAM Union-LUT Double-Buffered `tile_t=48` MoE Prefill v3 Metal Kernel (`nb_val ∈ {1..6}`, bit-exact `max_diff == 0.0`):** aliases mutually-exclusive Hadamard (`tg_ht4`) and RTR (`tg_rtr`) LUTs into one 8 KB union (`17.0 KB → 12.9/15.1 KB ≤ 16.0 KB` SRAM, doubling M4 Pro occupancy from 1 to **2 threadgroups/core**), adds fine-grained `nb_val ∈ {1..6}` (`8..48` tokens) specialization with register-balanced `Am[RB][4]` + 1-register `Xm` streaming (zero register spilling), and pairs with an **Adaptive Memory-Aware Gear-Shifting Chunk Scheduler (`1024 → 512 → 256`)** — accelerating 48-visit MoE prefill by **`+37.5%`** and end-to-end 48-visit prefill on `12.8GB` from `342.5 tok/s` to **`426.6 tok/s` (`+24.6%`)**. Also includes an opt-in 2-slot parallel `SwiGLU + Paley-72 RHT-1152` Metal kernel (`LAMQ_PAR_SWIGLU=1`, `max_diff == 0.0`) and a standalone Quest L1-bounding-box KV page scoring Metal kernel (`quest.py`, `0.14 ms` at 64K / `0.17 ms` at 128K).
+   - **MoE Prefill v4 (`moe_v4.py`, `tile_t = 32/48/64`, 9.1 KB SRAM, Fused `GU → SwiGLU` + NVFP4-Skipping `RHT-1152`, bit-exact `max_diff == 0.0`):** sizes the threadgroup LUT union to exact per-layer needs (`4 KB` for HT, `1.5 KB` for NVFP4 with a 256-entry `half2` byte-pair LUT `tg_e2m1_p`, `8 KB` only when RTR1–3 is present), streams weights with per-`j` `A0/A1` registers (2 regs + 1 `Xm` reg, zero register spilling up to `tile_t = 64` inside **`9.1 KB` SRAM → 3 threadgroups/core** on M4 Pro), fuses `GU → Softcapped SwiGLU` in registers (`sorted_out=True` → `sorted_in=True`, eliminating the `[n_slots, 2304] f32` `y_gu` buffer and saving `-50..80 MB` peak RAM), and skips `H_16 + Paley-72` completely on all 19 pure-NVFP4 `dn` visits (and NVFP4 experts on 23 mixed visits) — pushing end-to-end 48-visit `12.8GB` prefill to **`385.0 tok/s` (`T=256`, `+7.0%` over v3)**, **`418.9–430.5 tok/s` (`T=512`)**, and **`431.0–446.0 tok/s` (`T=1024`, `+26–30%` over stock)** with **`max_diff == 0.0`**. Also includes an opt-in 2-slot parallel `SwiGLU + Paley-72 RHT-1152` Metal kernel (`LAMQ_PAR_SWIGLU=1`, `max_diff == 0.0`) and a standalone Quest L1-bounding-box KV page scoring Metal kernel (`quest.py`, `0.14 ms` at 64K / `0.17 ms` at 128K).
    - **16+ Core M4 Pro / Max Grid Tuning (`applegpu_g16s/c/d`):** removes 10-core base M4 throttling across `DenseStage` (**1.20×–1.90×**), `UnifiedMoESide` (**1.17×–1.76×**), and `T=1` Split-K SDPA (`48` splits).
    - **O(N) Global KV Pre-allocation + Zero-Copy Shared Global KV + Sliding-Window Trim (`W=1024`):** replaces `+256` reallocations with `4096`-step `_reserve_cap` (**118×** less KV copy overhead at 32K), shares append-only global KV buffers zero-copy between active generation and stored chat snapshots (**saves ~1.0–2.0 GB active RAM**), and trims 40 sliding KV slots back to `W=1024` on snapshot store.
 
@@ -81,7 +81,7 @@ Out of the box, `lookatmyquant`'s `lamq serve` already delivered remarkable comp
 | **Follow-up turn on cached screenshot** | N/A | **0 ms ViT**, instant KV reuse | **Zero ViT re-encode** |
 | **New agent chat (~24K sys/tools preamble)** | ~60s prefill every chat | **~2–3s** (RAM) / **~0.2s** (disk cache after restart) | **~24×–300× faster start** |
 | **Generated thinking + tool-call tokens on next turn** | Re-prefilled from scratch | **0 ms prefill** (3-tier `post_gen`/`pre_tool_gen` KV promotion) | **Instant turn handoff** |
-| **48-visit 12.8GB Prefill (`1024` tokens)** | 2,990 ms (`342.5 tok/s`, `chunk=256`) | **2,400 ms (`426.6 tok/s`)** (`tile_t=48` MoE v3 + adaptive chunk) | **+24.6% faster** (`max_diff 0.0`) |
+| **48-visit 12.8GB Prefill (`1024` tokens)** | 2,990 ms (`342.5 tok/s`, `chunk=256`) | **2,296–2,376 ms (`431–446 tok/s`)** (MoE v4 `tile_t=64` + fused `GU→SwiGLU`) | **+26%–30% faster** (`max_diff 0.0`) |
 | **32K / 64K FP8 `T=8` tree(`4-3`) verify SDPA** | 8.21 ms / 13.25 ms | **1.50 ms / 2.72 ms** (`rmse 4–6e-7`) | **5.46× / 4.86× faster** |
 | **64K FP8 `T=256` prefill FA2** | 73.81 ms / visit | **48.07 ms** / visit (`rmse 2.7e-8`) | **1.54× faster** (`-206 ms`/chunk) |
 | **32K Global KV reallocation copies** | 4.74 s (`+256` step) | **0.04 s** (pre-reserved `4096`) | **118× less overhead** |
@@ -239,7 +239,7 @@ print(resp.choices[0].message.content)
 | `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
 | `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
 | `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
-| `UnifiedMoESide` 48× Prefill (`1024` tok, 12.8GB) | 2,846.8 ms (`v2, tile_t=32`) | **1,553.9 ms** (`v3, tile_t=48, nb=1..6`) | **1.83×** | bit-exact (`0.0`) |
+| `UnifiedMoESide` 48× Prefill (`1024` tok, 12.8GB) | 2,990 ms E2E (`v2, tile_t=32`) | **2,296–2,376 ms E2E** (`v4, tile_t=64, fused GU→SwiGLU`) | **1.26×–1.30× E2E** (`+7.0%` at `T=256` vs v3) | bit-exact (`0.0`) |
 | 32K Global KV reallocation copies | 4.74 s (`+256` step) | **0.04 s** (pre-reserved) | **118×** | bit-exact |
 
 </details>
@@ -269,7 +269,7 @@ All standard `lamq serve` flags are forwarded untouched alongside these wrapper 
 
 ## Development & Tests
 
-Run the offline unit + Metal numerical parity test suite (106 tests, requires no model weights):
+Run the offline unit + Metal numerical parity test suite (114 tests, requires no model weights):
 
 ```zsh
 uv pip install -e ".[dev]"

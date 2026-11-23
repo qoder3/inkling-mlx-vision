@@ -2415,8 +2415,16 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                     output_shapes=[(n_slots, self.m_rows)],
                     output_dtypes=[mx.float32],
                 )[0]
-            # Prefill (non-MPP): Lean-SRAM Union-LUT MoE Prefill v3 (12.9/15.1 KB SRAM -> 2 TGs/core + nb=1..6 + sg=4 at all T)
+            # Prefill (non-MPP): MoE Prefill v4 (`tile_t=64`, 9.1 KB SRAM -> 3 TGs/core, per-j A0/A1 streaming, opt-out via LAMQ_MOE_V4=0)
             if not _fk._has_mpp():
+                if os.environ.get("LAMQ_MOE_V4", "1") != "0":
+                    from .moe_v4 import run_moe_side_prefill_v4
+
+                    return run_moe_side_prefill_v4(
+                        self, x_rot_f16, eids_flat, x_div,
+                        sorted_cache=sorted_cache, sorted_in=sorted_in, sorted_out=sorted_out,
+                        x_raw_f16=x_raw_f16,
+                    )
                 offsets, order = sorted_cache if sorted_cache is not None else _fk.compute_moe_sorted_offsets(eids_flat)
                 max_nb = 6 if n_slots > 2048 else 4
                 tile_t = 8 * max_nb
@@ -2445,12 +2453,71 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         _fk.DenseStage.matmul_rotated_f16 = _tuned_dense_mm
         _fk.UnifiedMoESide.__call__ = _tuned_moe_call
 
+    # 3b. MoE Prefill v4 Fused `GU -> SwiGLU -> [NVFP4-skipping RHT-1152] -> DN` (`tile_t=64`, 9.1 KB SRAM, bit-exact 0.0)
+    moe_v4_enabled = (not _fk._has_mpp()) and (os.environ.get("LAMQ_MOE_V4", "1") != "0")
+    if moe_v4_enabled and hasattr(_model_mod, "PackedMoE"):
+        from .moe_v4 import fused_moe_prefill_v4
+
+        orig_packed_moe_prerot = _model_mod.PackedMoE.forward_fast_fused_prerot
+
+        def _fused_v4_moe_prerot(
+            self,
+            h_mlp_f16: mx.array,
+            x_rot_gu_f16: mx.array,
+            residual: mx.array,
+            post_mlp_conv_w: mx.array,
+            cache,
+            cache_slot: int,
+            T: int,
+            tree_lag: mx.array | None = None,
+        ) -> mx.array:
+            if (
+                T > 8
+                and os.environ.get("LAMQ_MOE_V4", "1") != "0"
+                and self.gu_unified.n_rg == 1
+                and self.gu_unified.m_rows == 2304
+                and self.dn_unified.n_cols == 1152
+            ):
+                logits_f16 = h_mlp_f16 @ self.router_w_f16.T
+                dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
+                if dyn:
+                    eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
+                        logits_f16, self.router_bias, self.cfg.route_scale,
+                        k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
+                        ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                    )
+                else:
+                    eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
+                        logits_f16, self.router_bias, self.cfg.route_scale
+                    )
+                sc = _model_mod.compute_moe_sorted_offsets(eids_flat)
+                y_dn = fused_moe_prefill_v4(
+                    self.gu_unified, self.dn_unified,
+                    h_mlp_f16, x_rot_gu_f16, self.dn_signs_in,
+                    eids_flat, sc,
+                    gate_cap=self.cfg.mlp_gate_softcap,
+                    up_cap=self.cfg.mlp_up_softcap,
+                    dynamic_routing=dyn,
+                )
+                prev = cache.get_conv_prev(cache_slot, 3, 2304)
+                out, new_prev, raw_sum = _model_mod.moe_wsum_sconv4_res_fused(
+                    y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn
+                )
+                cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
+                return out
+            return orig_packed_moe_prerot(
+                self, h_mlp_f16, x_rot_gu_f16, residual, post_mlp_conv_w, cache, cache_slot, T, tree_lag=tree_lag
+            )
+
+        _model_mod.PackedMoE.forward_fast_fused_prerot = _fused_v4_moe_prerot
+
     _INSTALLED = True
     summary = {
         "installed": True,
         "custom_gqa_sg8_sdpa": True,
         "custom_drafter_gqa12_sdpa": True,
         "custom_radix_topp": True,
+        "moe_prefill_v4_fused": moe_v4_enabled,
         "ngram_default": ngram_enabled,
         "kv_alloc_step": _kv_step,
         "m4_pro_grid_tuning": m4_pro,
@@ -2458,6 +2525,7 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
     if log_fn is not None:
         log_fn(
             f"metal accel enabled: GQA-SG8 SDPA + GQA-FA2 + DSpark-GQA12 SDPA + Radix-TopP "
+            f"+ MoE-v4-Fused={'on' if moe_v4_enabled else 'off'} "
             f"+ Ngram={'on' if ngram_enabled else 'off'} + O(N) KV(4096) "
             f"+ M4-Pro-16c={'on' if m4_pro else 'off'}"
         )
