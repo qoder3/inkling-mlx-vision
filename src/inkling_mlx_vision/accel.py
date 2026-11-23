@@ -1840,6 +1840,28 @@ def fast_swiglu_rht_1152(
     return (outs[0], outs[1]) if also_raw else outs[0]
 
 
+def calibrate_draft_temp(temp: float, scale: float | None = None) -> float:
+    """Scale draft sampling temperature `tau_q = gamma * tau_p` (`0 < gamma <= 1`) for higher acceptance at 0% target bias.
+
+    In Leviathan et al. (2023) speculative rejection sampling, ANY valid proposal distribution `q(x)` that returns its
+    exact probability vector `probs_q` to `verify_spec_sample_gpu` preserves the target distribution `p(x)` with 100%
+    mathematical exactness. Because the 3-layer DSpark drafter has slightly higher logit entropy than the 48-visit
+    target model, sharpening `tau_q = 0.75 * tau_p` increases the distribution overlap `sum_x min(p(x), q(x))`.
+    """
+    t = float(temp)
+    if t <= 0.0:
+        return t
+    if scale is None:
+        try:
+            scale = float(os.environ.get("LAMQ_DRAFT_TEMP_SCALE", "0.75"))
+        except ValueError:
+            scale = 0.75
+    s = float(scale)
+    if 0.0 < s < 1.0:
+        return max(1e-4, t * s)
+    return t
+
+
 # --------------------------------------------------------------------------- O(N) Global KV Allocation & M4 Pro Tuning
 
 
@@ -2106,8 +2128,19 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                 super().__init__(initial_tokens)
             self._eos_ids = ctx.get("eos_ids", frozenset((200006,))) if isinstance(ctx, dict) else frozenset((200006,))
             self._prompt_cache = pc
+            self._consec_ngram_toks = 0
+            self._ngram_cooldown = 0
+            self._max_consec_ngram_toks = int(os.environ.get("LAMQ_NGRAM_MAX_RUN", "96"))
             if isinstance(ctx, dict):
                 ctx["ngram_idx"] = self
+
+        def propose(self, anchor: int, max_draft: int = 8, min_cont: int = 2, eos=frozenset(), *, min_n: int = 3):
+            if self._ngram_cooldown > 0:
+                self._ngram_cooldown -= 1
+                self._last_hit = None
+                self._cursor = None
+                return None
+            return super().propose(anchor, max_draft=max_draft, min_cont=min_cont, eos=eos, min_n=min_n)
 
         def observe(self, raw, k_match: int, block_size: int, was_ngram: bool) -> None:
             if raw and self._eos_ids:
@@ -2125,7 +2158,27 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                                 if ag.get("drafter") is not None:
                                     ag["drafter"]._trim_push_to = keep
                         break
+            hit_before = self._last_hit
             super().observe(raw, k_match, block_size, was_ngram)
+            if was_ngram and k_match > 0:
+                self._consec_ngram_toks += int(k_match)
+                if self._max_consec_ngram_toks > 0 and self._consec_ngram_toks >= self._max_consec_ngram_toks:
+                    # Break runaway contiguous N-gram self-copy rails and hand control back to DSpark for 8 rounds
+                    if hit_before is not None:
+                        hn, hkey, _ = hit_before
+                        if hn > 0 and hkey is not None and hn in self.tables:
+                            self.tables[hn][hkey] = None
+                            self._has_tombstones = True
+                    if len(self.tokens) >= 5:
+                        t5_key = tuple(self.tokens[-5:])
+                        if t5_key in self._t5:
+                            self._t5[t5_key] = None
+                            self._has_tombstones = True
+                    self._cursor = None
+                    self._consec_ngram_toks = 0
+                    self._ngram_cooldown = 8
+            else:
+                self._consec_ngram_toks = 0
 
     _gen_mod.NgramDraftIndex = _CachedNgramDraftIndex
 
@@ -2356,8 +2409,15 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
             return orig_sg8(self, x_rot_tr_f16, T=T, rb=rb, sg=sg, ntg=ntg)
 
         def _tuned_dense_mm(self, x_rot_f16: mx.array, T: int, W_cached: mx.array | None = None) -> mx.array:
-            if T == 1 and self.total_out > 10000:
-                rps, sg, ntg = 2, 8, 160
+            if T == 1:
+                if self.total_out > 10000:
+                    rps, sg, ntg = 2, 8, 160
+                elif self.total_out <= 3072:
+                    # o_stage (3072 -> 2304): 6 TGs/core on 16-core M4 Pro (1.31x faster than stock ntg=160 with 16 empty TGs)
+                    rps, sg, ntg = 2, 4, 96
+                else:
+                    # qkv_stage (2304 -> 8576): 9 TGs/core on 16-core M4 Pro (1.20x faster than stock rps=1, sg=4, ntg=160)
+                    rps, sg, ntg = 2, 8, 144
                 kern = _fk._make_dense_stage_kernel(self.n, self.fids, 1, rps=rps, sg=sg, stage_rtr=self._stage_rtr)
                 mt = _fk._u32(self.total_out, self.n_mats, ntg)
                 return kern(
@@ -2365,6 +2425,18 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                     grid=(ntg * sg * 32, 1, 1),
                     threadgroup=(sg * 32, 1, 1),
                     output_shapes=[(1, self.total_out)],
+                    output_dtypes=[mx.float32],
+                )[0]
+            if 2 <= T <= 8:
+                # o_stage (m=2304, rps=2 -> 1152 blocks, sg=4 -> 8 blocks/TG => 144 = 16*9 exact TGs, 1 block/TG, 0 wave tail vs stock ntg=40!)
+                rps, sg, ntg = 2, 4, 144
+                kern = _fk._make_dense_stage_kernel(self.n, self.fids, T, rps=rps, sg=sg, stage_rtr=self._stage_rtr)
+                mt = _fk._u32(self.total_out, self.n_mats, ntg)
+                return kern(
+                    inputs=[x_rot_f16.reshape(-1), self.codes, self.scales, self.levels, self.dims, *self._lut_args, mt],
+                    grid=(ntg * sg * 32, 1, 1),
+                    threadgroup=(sg * 32, 1, 1),
+                    output_shapes=[(T, self.total_out)],
                     output_dtypes=[mx.float32],
                 )[0]
             return orig_dense_mm(self, x_rot_f16, T, W_cached=W_cached)
@@ -2454,9 +2526,14 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         _fk.UnifiedMoESide.__call__ = _tuned_moe_call
 
     # 3b. MoE Prefill v4 Fused `GU -> SwiGLU -> [NVFP4-skipping RHT-1152] -> DN` (`tile_t=64`, 9.1 KB SRAM, bit-exact 0.0)
+    #     + Decode (`T <= 8`) NVFP4-skipping SwiGLU/RHT-1152 across 42/48 visits of 12.8GB (19 pure-NVFP4 + 23 mixed)
     moe_v4_enabled = (not _fk._has_mpp()) and (os.environ.get("LAMQ_MOE_V4", "1") != "0")
     if moe_v4_enabled and hasattr(_model_mod, "PackedMoE"):
-        from .moe_v4 import fused_moe_prefill_v4
+        from .moe_v4 import (
+            fast_nv_skip_swiglu_rht1152_f16,
+            fast_swiglu_only_f16,
+            fused_moe_prefill_v4,
+        )
 
         orig_packed_moe_prerot = _model_mod.PackedMoE.forward_fast_fused_prerot
 
@@ -2472,44 +2549,120 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
             tree_lag: mx.array | None = None,
         ) -> mx.array:
             if (
-                T > 8
-                and os.environ.get("LAMQ_MOE_V4", "1") != "0"
+                os.environ.get("LAMQ_MOE_V4", "1") != "0"
                 and self.gu_unified.n_rg == 1
                 and self.gu_unified.m_rows == 2304
                 and self.dn_unified.n_cols == 1152
             ):
-                logits_f16 = h_mlp_f16 @ self.router_w_f16.T
-                dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
-                if dyn:
-                    eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
-                        logits_f16, self.router_bias, self.cfg.route_scale,
-                        k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
-                        ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                if T > 8:
+                    logits_f16 = h_mlp_f16 @ self.router_w_f16.T
+                    dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
+                    if dyn:
+                        eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
+                            logits_f16, self.router_bias, self.cfg.route_scale,
+                            k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
+                            ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                        )
+                    else:
+                        eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
+                            logits_f16, self.router_bias, self.cfg.route_scale
+                        )
+                    sc = _model_mod.compute_moe_sorted_offsets(eids_flat)
+                    y_dn = fused_moe_prefill_v4(
+                        self.gu_unified, self.dn_unified,
+                        h_mlp_f16, x_rot_gu_f16, self.dn_signs_in,
+                        eids_flat, sc,
+                        gate_cap=self.cfg.mlp_gate_softcap,
+                        up_cap=self.cfg.mlp_up_softcap,
+                        dynamic_routing=dyn,
                     )
-                else:
-                    eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
-                        logits_f16, self.router_bias, self.cfg.route_scale
+                    prev = cache.get_conv_prev(cache_slot, 3, 2304)
+                    out, new_prev, raw_sum = _model_mod.moe_wsum_sconv4_res_fused(
+                        y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn
                     )
-                sc = _model_mod.compute_moe_sorted_offsets(eids_flat)
-                y_dn = fused_moe_prefill_v4(
-                    self.gu_unified, self.dn_unified,
-                    h_mlp_f16, x_rot_gu_f16, self.dn_signs_in,
-                    eids_flat, sc,
-                    gate_cap=self.cfg.mlp_gate_softcap,
-                    up_cap=self.cfg.mlp_up_softcap,
-                    dynamic_routing=dyn,
-                )
-                prev = cache.get_conv_prev(cache_slot, 3, 2304)
-                out, new_prev, raw_sum = _model_mod.moe_wsum_sconv4_res_fused(
-                    y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn
-                )
-                cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
-                return out
+                    cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
+                    return out
+                if self.dn_unified.has_nvfp4 and self.dn_unified.n_rg == 1:
+                    logits_f16 = h_mlp_f16 @ self.router_w_f16.T
+                    dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
+                    if 2 <= T <= 8:
+                        if dyn:
+                            eids_flat, w_norm, gu_plan, dn_plan = _model_mod.sigmoid_top8_norm_and_plan_fast(
+                                logits_f16, self.router_bias, self.cfg.route_scale,
+                                self.gu_unified.exp_fid, self.gu_unified.fids,
+                                self.dn_unified.exp_fid, self.dn_unified.fids,
+                                k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
+                                ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                            )
+                        else:
+                            eids_flat, w_norm, gu_plan, dn_plan = _model_mod.sigmoid_top8_norm_and_plan_fast(
+                                logits_f16, self.router_bias, self.cfg.route_scale,
+                                self.gu_unified.exp_fid, self.gu_unified.fids,
+                                self.dn_unified.exp_fid, self.dn_unified.fids,
+                            )
+                    else:
+                        if dyn:
+                            eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
+                                logits_f16, self.router_bias, self.cfg.route_scale,
+                                k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
+                                ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                            )
+                        else:
+                            eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
+                                logits_f16, self.router_bias, self.cfg.route_scale
+                            )
+                        gu_plan = dn_plan = None
+                    y_gu = self.gu_unified(
+                        x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=None, plan=gu_plan,
+                        dynamic_routing=dyn, x_raw_f16=h_mlp_f16,
+                    )
+                    if self.dn_unified.fids == (7,):
+                        # 19/48 pure-NVFP4 visits: 100% skip RHT-1152 and second buffer allocation!
+                        act_raw = fast_swiglu_only_f16(
+                            y_gu, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
+                            eids_flat=eids_flat if dyn else None,
+                        )
+                        act_rot = act_raw
+                    else:
+                        # 23/48 mixed visits: skip H_16 + Paley-72 RHT-1152 on every NVFP4 slot (75-90% of slots)!
+                        act_rot, act_raw = fast_nv_skip_swiglu_rht1152_f16(
+                            y_gu, self.dn_signs_in, eids_flat, self.dn_unified.exp_fid,
+                            self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
+                        )
+                    y_dn = self.dn_unified(
+                        act_rot, eids_flat, x_div=1, sorted_cache=None, plan=dn_plan,
+                        dynamic_routing=dyn, x_raw_f16=act_raw,
+                    )
+                    prev = cache.get_conv_prev(cache_slot, 3, 2304)
+                    out, new_prev, raw_sum = _model_mod.moe_wsum_sconv4_res_fused(
+                        y_dn, w_norm, prev, post_mlp_conv_w, residual, T, tree_lag=tree_lag, skip_zero_w=dyn
+                    )
+                    cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
+                    return out
             return orig_packed_moe_prerot(
                 self, h_mlp_f16, x_rot_gu_f16, residual, post_mlp_conv_w, cache, cache_slot, T, tree_lag=tree_lag
             )
 
         _model_mod.PackedMoE.forward_fast_fused_prerot = _fused_v4_moe_prerot
+
+    # 3c. Temperature-Calibrated Draft Proposal (`tau_q = gamma * tau_p`, 0% target distribution bias)
+    if hasattr(_model_mod, "PackedLMHead") and hasattr(_model_mod.PackedLMHead, "get_draft_head_sampler"):
+        orig_get_draft_sampler = _model_mod.PackedLMHead.get_draft_head_sampler
+
+        def _calibrated_get_draft_head_sampler(
+            self,
+            temp: float,
+            top_p: float = 1.0,
+            top_k: int = 0,
+            max_buckets: int = 5,
+            bits: int = 4,
+        ):
+            eff_temp = calibrate_draft_temp(temp)
+            return orig_get_draft_sampler(
+                self, eff_temp, top_p=top_p, top_k=top_k, max_buckets=max_buckets, bits=bits
+            )
+
+        _model_mod.PackedLMHead.get_draft_head_sampler = _calibrated_get_draft_head_sampler
 
     _INSTALLED = True
     summary = {

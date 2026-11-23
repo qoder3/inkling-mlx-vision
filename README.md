@@ -268,6 +268,10 @@ print(resp.choices[0].message.content)
 | Quest L1-box page scores (`64K` / `128K`) | N/A | **0.14 ms** / **0.17 ms** (Metal) | — | exact upper bound |
 | `DenseStage.dequant_f16` (M4 Pro 16c) | 1.07 ms (`ntg=10`) | **0.56 ms** (`ntg=48`) | **1.90×** | bit-exact |
 | `DenseStage` LM head `T=8` (`sg8`) | 5.08 ms (`ntg=20`) | **2.97 ms** (`ntg=128`) | **1.71×** | bit-exact |
+| `DenseStage` `o_stage` (`3072→2304`, `T=1..8`) | `ntg=160` (`T=1`) / `ntg=40` (`T=2..8`) | **`ntg=96` (`T=1`) / `ntg=144` (`T=2..8`)** | **1.24×–1.31×** | bit-exact (`0.0`) |
+| `PackedMoE` Decode (`T=1..8`) NVFP4 `RHT-1152` Skip | Full `H_16 + Paley-72` on all 48 visits | **100% RHT skip on 19 pure-NVFP4 visits + per-slot skip on 23 mixed visits** | **42/48 visits skip RHT** | bit-exact (`0.0`) |
+| Temperature-Calibrated Draft Proposal (`temp=0.6`) | Unscaled $\tau_q = \tau_p$ | **$\tau_q = 0.75\,\tau_p$ (`LAMQ_DRAFT_TEMP_SCALE=0.75`)** | **Higher draft acceptance** | **0.0% target dist bias** |
+| Deferred Global KV Sharing (`pre_tool_gen` & `store`) | `refcount=2` → MLX Copy-on-Write clone | **Deferred global attach (`refcount=1` during decode)** | **0 MB CoW spike** (saves `0.7–1.4 GB`) | bit-exact |
 | `UnifiedMoESide` GU `T=1` (M4 Pro 16c) | 0.36 ms (`sg=4,ntg=60`) | **0.21 ms** (`sg=8,ntg=96`) | **1.76×** | bit-exact |
 | `UnifiedMoESide` 48× Prefill (`1024` tok, 12.8GB) | 2,990 ms E2E (`v2, tile_t=32`) | **2,296–2,376 ms E2E** (`v4, tile_t=64, fused GU→SwiGLU`) | **1.26×–1.30× E2E** (`+7.0%` at `T=256` vs v3) | bit-exact (`0.0`) |
 | 32K Global KV reallocation copies | 4.74 s (`+256` step) | **0.04 s** (pre-reserved) | **118×** | bit-exact |
@@ -299,7 +303,7 @@ All standard `lamq serve` flags are forwarded untouched alongside these wrapper 
 
 ## Development & Tests
 
-Run the offline unit + Metal numerical parity test suite (114 tests, requires no model weights):
+Run the offline unit + Metal numerical parity test suite (119 tests, requires no model weights):
 
 ```zsh
 uv pip install -e ".[dev]"

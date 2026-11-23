@@ -250,10 +250,12 @@ class MonitoredOutputParser(_OrigOutputParser):
 
     loop_guard_enabled: bool = True
     max_discard_tool_tokens: int = 1024
-    loop_window: int = 512
+    loop_window: int = 4096
     loop_min_span: int = 256
     loop_min_reps: int = 6
     loop_max_period: int = 64
+    loop_long_max_period: int = 2048
+    loop_anchor_len: int = 24
     log_interval_s: float = 2.0
     log_fn: Callable[[str], None] = staticmethod(lambda _msg: None)
 
@@ -340,11 +342,12 @@ class MonitoredOutputParser(_OrigOutputParser):
         self.done, self.finish = True, "tool_calls"
 
     def detect_loop(self) -> tuple[int, int] | None:
-        """Return `(period, reps)` if trailing tokens repeat verbatim for `>= loop_min_span` tokens."""
+        """Return `(period, reps)` if trailing tokens repeat verbatim for short (`<= 64`) or long (`<= 2048`) periods."""
         buf = list(self._recent)
         n = len(buf)
         if n < self.loop_min_span:
             return None
+        # 1. Exact short-period check (1 .. loop_max_period)
         for p in range(1, self.loop_max_period + 1):
             reps = max(self.loop_min_reps, (self.loop_min_span + p - 1) // p)
             span = p * reps
@@ -358,6 +361,48 @@ class MonitoredOutputParser(_OrigOutputParser):
                     break
             if ok:
                 return p, reps
+        # 2. Fast anchor-filtered medium/long-period check (loop_max_period + 1 .. loop_long_max_period)
+        max_long_p = min(self.loop_long_max_period, n // 2)
+        anchor_len = min(self.loop_anchor_len, self.loop_max_period)
+        if max_long_p > self.loop_max_period and n >= max(384, 2 * anchor_len):
+            last_tok = buf[n - 1]
+            prev_tok = buf[n - 2]
+            anchor = buf[n - anchor_len :]
+            for p in range(self.loop_max_period + 1, max_long_p + 1):
+                if buf[n - 1 - p] != last_tok or buf[n - 2 - p] != prev_tok:
+                    continue
+                reps = 2 if p >= 384 else max(3, (384 + p - 1) // p)
+                if p * reps > n:
+                    continue
+                if buf[n - anchor_len - p : n - p] != anchor:
+                    continue
+                unit = buf[n - p :]
+                ok = True
+                for k in range(2, reps + 1):
+                    if buf[n - k * p : n - (k - 1) * p] != unit:
+                        ok = False
+                        break
+                if ok:
+                    return p, reps
+        # 3. Quasi-periodic / non-uniform block repetition check (64-token phrase emitted >= 3 times in current turn)
+        blk_len = 64
+        if n >= 512:
+            tail_blk = buf[n - blk_len :]
+            last_tok = tail_blk[-1]
+            prev_tok = tail_blk[-2]
+            matches = 0
+            first_gap = 0
+            i = n - 2 * blk_len
+            while i >= 0:
+                if buf[i + blk_len - 1] == last_tok and buf[i + blk_len - 2] == prev_tok and buf[i : i + blk_len] == tail_blk:
+                    matches += 1
+                    if first_gap == 0:
+                        first_gap = (n - blk_len) - i
+                    if matches >= 2:
+                        return first_gap, matches + 1
+                    i -= blk_len
+                else:
+                    i -= 1
         return None
 
     def feed(self, t: int) -> list:

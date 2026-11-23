@@ -33,10 +33,10 @@ def test_utf8_byte_bound_pre_tokenization_gate():
     assert cnt > 600
     assert not server.exceeds_char_budget(cnt, ctx=131072)
 
-    # 1.0M chars (~330K-400K tokens of code/JSON) must be rejected before BPE at 131K context (ctx * 7 = 917K)
-    giant = [{"role": "user", "content": "a" * (131072 * 7)}]
+    # 655K+ chars (~330K-400K tokens of code/JSON) must be rejected before BPE at 131K context (ctx * 5 = 655,360)
+    giant = [{"role": "user", "content": "a" * (131072 * 5)}]
     assert server.exceeds_char_budget(server.message_char_count(giant), ctx=131072)
-    assert not server.exceeds_char_budget(131072 * 6, ctx=131072)
+    assert not server.exceeds_char_budget(131072 * 4, ctx=131072)
 
     # Normalized dict tool arguments must also trigger the gate (not len(dict) == 1!)
     giant_tool = [
@@ -509,3 +509,167 @@ def test_quest_page_bounding_box_upper_bound():
     # On the needle query head (head 9), sparse attention should closely match dense attention
     err_needle = float(np.max(np.abs(np.asarray(dense_out[9]) - np.asarray(sparse_out[9]))))
     assert err_needle < 5e-2, f"Needle head sparse error too large: {err_needle}"
+
+
+# --------------------------------------------------------------------------- v0.5.3 Tests
+
+
+def test_v053_decode_swiglu_only_f16_and_nv_skip_rht1152_bit_exact():
+    from inkling_mlx_vision.moe_v4 import (
+        fast_nv_skip_swiglu_rht1152_f16,
+        fast_swiglu_only_f16,
+    )
+
+    mx.random.seed(2026)
+    for n_slots in (8, 48, 64):
+        y_gu = mx.random.normal((n_slots, 2304)).astype(mx.float32) * 3.0
+        signs = mx.where(mx.random.uniform(shape=(1152,)) > 0.5, 1.0, -1.0).astype(mx.float32)
+        eids = mx.array([((i * 7) % 64) if (i % 11 != 5) else 0xFFFFFFFF for i in range(n_slots)], dtype=mx.uint32)
+        exp_fid = mx.array([7 if (e % 4 != 0) else 2 for e in range(64)], dtype=mx.uint32)
+        mx.eval(y_gu, signs, eids, exp_fid)
+
+        # 1. Pure-NVFP4 fast_swiglu_only_f16 (with and without sentinel skipping)
+        ref_rot0, ref_raw0 = accel._ORIG_SWIGLU_RHT1152(y_gu, signs, 4.0, 25.0, out_dtype=mx.float16, also_raw=True)
+        raw0 = fast_swiglu_only_f16(y_gu, 4.0, 25.0)
+        mx.eval(ref_raw0, raw0)
+        assert float(mx.max(mx.abs(raw0 - ref_raw0)).item()) == 0.0
+
+        ref_rot1, ref_raw1 = accel._ORIG_SWIGLU_RHT1152(
+            y_gu, signs, 4.0, 25.0, out_dtype=mx.float16, eids_flat=eids, also_raw=True
+        )
+        raw1 = fast_swiglu_only_f16(y_gu, 4.0, 25.0, eids_flat=eids)
+        mx.eval(ref_rot1, ref_raw1, raw1)
+        assert float(mx.max(mx.abs(raw1 - ref_raw1)).item()) == 0.0
+
+        # 2. Mixed-NVFP4 fast_nv_skip_swiglu_rht1152_f16: raw matches everywhere, rot matches on non-NVFP4 live slots
+        rot2, raw2 = fast_nv_skip_swiglu_rht1152_f16(y_gu, signs, eids, exp_fid, 4.0, 25.0)
+        mx.eval(rot2, raw2)
+        assert float(mx.max(mx.abs(raw2 - ref_raw1)).item()) == 0.0
+        eids_np = np.asarray(eids)
+        fids_np = np.asarray(exp_fid)
+        for s in range(n_slots):
+            eid = int(eids_np[s])
+            if eid != 0xFFFFFFFF and int(fids_np[eid]) != 7:
+                assert float(mx.max(mx.abs(rot2[s] - ref_rot1[s])).item()) == 0.0
+
+
+def test_v053_temp_calibrated_draft_sampler_unbiased_and_higher_acceptance():
+    assert abs(accel.calibrate_draft_temp(0.6, scale=0.75) - 0.45) < 1e-9
+    assert accel.calibrate_draft_temp(0.0, scale=0.75) == 0.0
+    assert abs(accel.calibrate_draft_temp(0.6, scale=1.0) - 0.6) < 1e-9
+
+    # Target logits vs slightly noisier 3-layer drafter logits at target temp = 0.6
+    rng = np.random.default_rng(42)
+    target_logits = np.array([3.2, 2.4, 1.5, 0.8, 0.1, -0.5, -1.2, -2.0], dtype=np.float64)
+    # 3-layer drafter has flatter scale (~0.75x) before temperature scaling
+    draft_logits = target_logits * 0.75 + rng.normal(0.0, 0.08, size=target_logits.shape)
+
+    def softmax_t(logits, t):
+        z = (logits - logits.max()) / t
+        e = np.exp(z)
+        return e / e.sum()
+
+    p_target = softmax_t(target_logits, 0.6)
+    q_unscaled = softmax_t(draft_logits, 0.6)
+    q_calibrated = softmax_t(draft_logits, accel.calibrate_draft_temp(0.6, scale=0.75))
+
+    # Acceptance rate alpha = sum_x min(p(x), q(x)) is strictly higher with temperature calibration
+    alpha_unscaled = float(np.minimum(p_target, q_unscaled).sum())
+    alpha_calibrated = float(np.minimum(p_target, q_calibrated).sum())
+    assert alpha_calibrated > alpha_unscaled
+
+    # Exact marginal output distribution under speculative rejection sampling equals p_target (0.0 bias!)
+    residual = np.maximum(0.0, p_target - q_calibrated)
+    residual /= residual.sum()
+    p_marginal = np.minimum(p_target, q_calibrated) + (1.0 - alpha_calibrated) * residual
+    assert float(np.max(np.abs(p_marginal - p_target))) < 1e-15
+
+
+def test_v053_pre_tool_gen_defers_global_kv_zero_cow():
+    from inkling_mlx_vision import cache as _cache_mod
+
+    class _DummyFastCache:
+        _fast = True
+        _spec_recording = False
+
+        def __init__(self):
+            self.seq_len = 2500
+            self.keys = [None, None]
+            self.values = [None, None]
+            self.kv_is_sliding = [True, False]
+            self.kv_f16 = [mx.zeros((1, 4, 1024, 64), dtype=mx.float16), None]
+            self.kv_u8 = [None, mx.zeros((1, 8, 8192, 256), dtype=mx.uint8)]
+            self.kv_q4_sc = [None, None]
+            self.kv_len = [1024, 2500]
+            self.kv_start = [1476, 0]
+            self.kv_cap = [1024, 8192]
+            self.conv_states = [[mx.zeros((1, 3, 64), dtype=mx.float16)] * 4 for _ in range(2)]
+            self._spec_base_kv_len = [1024, 2500]
+            self._reserve_cap = 0
+
+        @property
+        def state(self):
+            return [a for a in (*self.kv_f16, *self.kv_u8) if a is not None]
+
+    c = _DummyFastCache()
+    mx.eval(*c.state)
+
+    # Deferred global clone stores None for non-sliding slot 1 -> c.kv_u8[1] keeps refcount == 1!
+    stored = _cache_mod._clone_cache_for_store(c, share_global=True, defer_global=True)
+    assert stored.kv_u8[1] is None
+    assert stored.kv_f16[0] is not None
+
+    mem_before = int(mx.get_active_memory())
+    c.kv_u8[1][:, :, 2500:2501, :] = 7
+    mx.eval(c.kv_u8[1])
+    mem_after = int(mx.get_active_memory())
+    # Zero Copy-on-Write duplication of the 16.8 MB global kv_u8 buffer!
+    assert (mem_after - mem_before) < 1_000_000
+
+    # Syncing attaches the finished global buffer zero-copy
+    _cache_mod._sync_shared_global_buffers(stored, None, c, None)
+    assert stored.kv_u8[1] is c.kv_u8[1]
+    assert int(stored.kv_u8[1][0, 0, 2500, 0].item()) == 7
+
+
+def test_v053_long_period_repetition_loop_detection():
+    from inkling_mlx_vision.parser import MonitoredOutputParser
+
+    class _Tok:
+        def decode(self, toks, **_kw):
+            return "x" * len(toks)
+
+    ids = {
+        "user": 200000, "model": 200001, "system": 200002, "tool": 200003,
+        "text": 200004, "thinking": 200005, "eos": 200006, "end": 200010,
+        "tool_json": 200011, "tool_text": 200012,
+    }
+    p = MonitoredOutputParser(_Tok(), ids, tool_names=set())
+    p.feed(ids["thinking"])
+    # 1. 1,500 non-repeating tokens do NOT trigger false positive
+    for i in range(1500):
+        p.feed(100 + ((i * 97 + (i // 31) * 13) % 5000))
+    assert not p.done
+
+    # 2. A 600-token reasoning loop (> old 64/256 limit, <= 2048 new limit) triggers after 2 full periods (1,200 tokens)
+    p2 = MonitoredOutputParser(_Tok(), ids, tool_names=set())
+    p2.feed(ids["thinking"])
+    pattern = [1000 + ((i * 37 + 11) % 900) for i in range(600)]
+    for step in range(1400):
+        p2.feed(pattern[step % 600])
+        if p2.done:
+            break
+    assert p2.done, "Expected 600-token periodic thinking loop to be caught within 2.3 periods"
+
+
+def test_v053_char_budget_includes_tools_and_ctx_times_5():
+    msgs = [{"role": "user", "content": "a" * 300_000}]
+    tools = [{"type": "function", "function": {"name": "big_tool", "description": "d" * 360_000}}]
+    c_no_tools = server.message_char_count(msgs)
+    c_with_tools = server.message_char_count(msgs, tools=tools)
+    assert c_no_tools == 300_000
+    assert c_with_tools >= 660_000
+    # 131072 * 5 = 655,360 chars -> messages alone fit, messages + 360K tools overflow before BPE!
+    assert not server.exceeds_char_budget(c_no_tools, 131072)
+    assert server.exceeds_char_budget(c_with_tools, 131072)
+

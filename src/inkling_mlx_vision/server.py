@@ -186,11 +186,11 @@ def _value_char_len(val: Any) -> int:
     return 6
 
 
-def message_char_count(messages: Any) -> int:
-    """Fast O(N)-char pre-tokenization size estimate across content, reasoning_content, and tool_calls."""
+def message_char_count(messages: Any, tools: Any = None) -> int:
+    """Fast O(N)-char pre-tokenization size estimate across content, reasoning_content, tool_calls, and tools."""
+    total = _value_char_len(tools) if tools else 0
     if not isinstance(messages, (list, tuple)):
-        return 0
-    total = 0
+        return total
     for m in messages:
         if not isinstance(m, dict):
             continue
@@ -205,7 +205,7 @@ def message_char_count(messages: Any) -> int:
     return total
 
 
-def exceeds_char_budget(tot_chars: int, ctx: int, max_chars_per_token: int = 7) -> bool:
+def exceeds_char_budget(tot_chars: int, ctx: int, max_chars_per_token: int = 5) -> bool:
     """Return True when `tot_chars` is guaranteed to overflow `ctx` tokens (rejects before BPE)."""
     return int(ctx) > 0 and int(tot_chars) >= int(ctx) * int(max_chars_per_token)
 
@@ -469,7 +469,7 @@ def install_patches(cfg: ServerConfig) -> None:
             raise _server.RequestError(400, "add_generation_prompt must be a boolean")
         ctx = int(getattr(self.args, "context", 131072) or 131072)
         if tokenize:
-            tot_chars = message_char_count(messages)
+            tot_chars = message_char_count(messages, tools=tools)
             if exceeds_char_budget(tot_chars, ctx):
                 est_toks = tot_chars // 3
                 raise _server.RequestError(

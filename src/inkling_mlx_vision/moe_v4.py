@@ -637,3 +637,252 @@ def fused_moe_prefill_v4(
         sorted_cache=sorted_cache, sorted_in=True, sorted_out=False,
         x_raw_f16=act_raw_s, fused_swiglu=False,
     )
+
+
+@lru_cache(maxsize=4)
+def make_swiglu_only_f16_kernel(skip_sentinel: bool = False):
+    """Zero-RHT, zero-barrier `y_gu -> act_raw_f16` kernel for pure-NVFP4 `dn` layers during decode (`T <= 8`).
+
+    On pure-NVFP4 `dn` visits (`dn.fids == (7,)`, 19/48 visits of 12.8GB), `dn_unified` only reads `x_raw_f16`
+    and never touches `act_rot`. This kernel computes softcapped SwiGLU with `grid=(288, n_slots, 1)` and
+    `threadgroup=(96, 1, 1)` (24 TGs at T=1, 144 TGs at T=6, 192 TGs at T=8 across 16 GPU cores), completely
+    eliminating `H_16 + Paley-72` RHT-1152 and the second output buffer (`max_diff == 0.0`).
+    """
+    extra_in = ["eids"] if skip_sentinel else []
+    guard = (
+        """
+    if (eids[slot] == 0xFFFFFFFFu) {
+        ((device half4*)(raw_out + (ulong)slot * 1152u))[tid] = half4(0.0h);
+        return;
+    }"""
+        if skip_sentinel
+        else ""
+    )
+    src = f"""
+    const uint tid = thread_position_in_grid.x;   // 0..287
+    const uint slot = thread_position_in_grid.y;  // 0..n_slots-1
+    const float g_cap = caps[0], g_inv = caps[1], u_cap = caps[2], u_inv = caps[3];{guard}
+    const device float4* gp4 = (const device float4*)(y_gu + (ulong)slot * 2304u);
+    const float4 g = gp4[tid], u = gp4[288u + tid];
+    const float4 raw_act = (metal::precise::tanh(g * g_inv) * g_cap)
+                         * (1.0f / (1.0f + metal::precise::exp(-g)))
+                         * (metal::precise::tanh(u * u_inv) * u_cap);
+    ((device half4*)(raw_out + (ulong)slot * 1152u))[tid] = half4(raw_act);
+    """
+    return mx.fast.metal_kernel(
+        name=f"ink_swiglu_only_f16_sk{int(skip_sentinel)}",
+        input_names=["y_gu", "caps"] + extra_in,
+        output_names=["raw_out"],
+        source=src,
+    )
+
+
+def fast_swiglu_only_f16(
+    y_gu: mx.array,
+    gate_cap: float = 4.0,
+    up_cap: float = 25.0,
+    *,
+    eids_flat: mx.array | None = None,
+) -> mx.array:
+    """Compute `[n_slots, 1152] float16` softcapped SwiGLU without RHT-1152 (`max_diff == 0.0`)."""
+    n_slots = int(y_gu.shape[0])
+    caps = _fk._f32_arr(gate_cap, 1.0 / gate_cap, up_cap, 1.0 / up_cap)
+    skip_s = eids_flat is not None
+    kern = make_swiglu_only_f16_kernel(skip_sentinel=skip_s)
+    ins = [y_gu.reshape(-1), caps]
+    if skip_s:
+        ins.append(eids_flat.astype(mx.uint32))
+    return kern(
+        inputs=ins,
+        grid=(288, n_slots, 1),
+        threadgroup=(96, 1, 1),
+        output_shapes=[(n_slots, 1152)],
+        output_dtypes=[mx.float16],
+    )[0]
+
+
+@lru_cache(maxsize=4)
+def make_nv_skip_swiglu_rht1152_f16_kernel(use_sg8: bool = False):
+    """1-slot-per-TG `SwiGLU + NVFP4-skipping RHT-1152` for mixed `dn` visits during decode (`T <= 8`).
+
+    On the 23 mixed `dn` visits (`dn.has_nvfp4 and dn.fids != (7,)`), 75-90% of experts are NVFP4 (`fid == 7`).
+    Since `slot = threadgroup_position_in_grid.y` is uniform across the threadgroup, any slot with
+    `exp_fid[eids[slot]] == 7` writes `raw_out` and returns before barriers or Paley-72 `B` loads (`max_diff == 0.0`).
+    """
+    if not use_sg8:
+        src_128 = """
+        const uint slot = threadgroup_position_in_grid.y;
+        const uint simd = simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        const uint hw = (simd << 1) | (lane >> 4); // 0..7
+        const uint hl = lane & 15u;                // 0..15
+        const uint c0 = hw * 9u;
+        device half* rop = raw_out + (ulong)slot * 1152u;
+        const uint eid = eids[slot];
+        if (eid == 0xFFFFFFFFu) {
+            for (uint j = 0; j < 9u; j++) rop[hl * 72u + c0 + j] = (half)0.0f;
+            return;
+        }
+        const device float* gp = y_gu + (ulong)slot * 2304u;
+        const device float* up = gp + 1152u;
+        const float g_cap = caps[0], g_inv = caps[1], u_cap = caps[2], u_inv = caps[3];
+        if (exp_fid[eid] == 7u) {
+            #pragma unroll
+            for (uint j = 0; j < 9u; j++) {
+                const uint idx = hl * 72u + c0 + j;
+                const float g = gp[idx], u = up[idx];
+                const float act = (metal::precise::tanh(g * g_inv) * g_cap)
+                                * (1.0f / (1.0f + metal::precise::exp(-g)))
+                                * (metal::precise::tanh(u * u_inv) * u_cap);
+                rop[idx] = (half)act;
+            }
+            return;
+        }
+        device half* op = out + (ulong)slot * 1152u;
+        threadgroup float tg_z[16 * 72];
+        const bool h1 = hl & 1u, h2 = hl & 2u, h4 = hl & 4u, h8 = hl & 8u;
+        #pragma unroll
+        for (uint j = 0; j < 9u; j++) {
+            const uint c = c0 + j;
+            const uint idx = hl * 72u + c;
+            const float g = gp[idx], u = up[idx];
+            const float act = (metal::precise::tanh(g * g_inv) * g_cap)
+                            * (1.0f / (1.0f + metal::precise::exp(-g)))
+                            * (metal::precise::tanh(u * u_inv) * u_cap);
+            rop[idx] = (half)act;
+            float v = act * signs[idx];
+            float o;
+            o = simd_shuffle_xor(v, 1u); v = h1 ? (o - v) : (v + o);
+            o = simd_shuffle_xor(v, 2u); v = h2 ? (o - v) : (v + o);
+            o = simd_shuffle_xor(v, 4u); v = h4 ? (o - v) : (v + o);
+            o = simd_shuffle_xor(v, 8u); v = h8 ? (o - v) : (v + o);
+            tg_z[idx] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const threadgroup float* zr = tg_z + hl * 72u;
+        constexpr float INV_S = 0.02946278254943948f;
+        #pragma unroll
+        for (uint j = 0; j < 9u; j++) {
+            const uint c = c0 + j;
+            const device float4* br = (const device float4*)(B + c * 72u);
+            float acc = 0.0f;
+            #pragma unroll
+            for (uint k4 = 0; k4 < 18u; k4++) {
+                const float4 b4 = br[k4];
+                const uint k = k4 * 4u;
+                acc += zr[k] * b4.x + zr[k + 1u] * b4.y + zr[k + 2u] * b4.z + zr[k + 3u] * b4.w;
+            }
+            op[hl * 72u + c] = (half)(acc * INV_S);
+        }
+        """
+        return mx.fast.metal_kernel(
+            name="ink_nv_skip_swiglu_rht1152_128_h",
+            input_names=["y_gu", "signs", "B", "caps", "eids", "exp_fid"],
+            output_names=["out", "raw_out"],
+            source=src_128,
+        )
+    src = """
+    const uint slot = threadgroup_position_in_grid.y;
+    const uint simd = simdgroup_index_in_threadgroup; // 0..8 (9 simdgroups = 288 threads)
+    const uint lane = thread_index_in_simdgroup;      // 0..31
+    const uint tid = simd * 32u + lane;               // 0..287
+    device half4* rop4 = (device half4*)(raw_out + (ulong)slot * 1152u);
+    const uint eid = eids[slot];
+    if (eid == 0xFFFFFFFFu) {
+        rop4[tid] = half4(0.0h);
+        return;
+    }
+    const device float4* gp4 = (const device float4*)(y_gu + (ulong)slot * 2304u);
+    const float g_cap = caps[0], g_inv = caps[1], u_cap = caps[2], u_inv = caps[3];
+    const float4 g = gp4[tid], u = gp4[288u + tid];
+    const float4 raw_act = (metal::precise::tanh(g * g_inv) * g_cap)
+                         * (1.0f / (1.0f + metal::precise::exp(-g)))
+                         * (metal::precise::tanh(u * u_inv) * u_cap);
+    rop4[tid] = half4(raw_act);
+    if (exp_fid[eid] == 7u) {
+        return;
+    }
+
+    const uint hw = lane >> 4, hl = lane & 15u;
+    const float4 s4 = ((const device float4*)signs)[tid];
+    const float4 act = raw_act * s4;
+    threadgroup float tg_z[16 * 73];
+    const uint a = tid / 18u, c = (tid - a * 18u) * 4u;
+    threadgroup float* dst = tg_z + a * 73u + c;
+    dst[0] = act.x; dst[1] = act.y; dst[2] = act.z; dst[3] = act.w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint c0 = simd * 8u + hw * 4u;
+    const bool h1 = hl & 1u, h2 = hl & 2u, h4 = hl & 4u, h8 = hl & 8u;
+    #pragma unroll
+    for (uint j = 0; j < 4u; j++) {
+        const uint cc = c0 + j;
+        float v = tg_z[hl * 73u + cc];
+        float o;
+        o = simd_shuffle_xor(v, 1u); v = h1 ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 2u); v = h2 ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 4u); v = h4 ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 8u); v = h8 ? (o - v) : (v + o);
+        tg_z[hl * 73u + cc] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 Acc0 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_float8x8 Acc1 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    #pragma unroll
+    for (uint kb = 0; kb < 9u; kb++) {
+        simdgroup_float8x8 Bm, Zm0, Zm1;
+        simdgroup_load(Bm, B + (simd * 8u) * 72u + kb * 8u, 72u, ulong2(0, 0), true);
+        simdgroup_load(Zm0, tg_z + kb * 8u, 73u, ulong2(0, 0), false);
+        simdgroup_load(Zm1, tg_z + 8u * 73u + kb * 8u, 73u, ulong2(0, 0), false);
+        simdgroup_multiply_accumulate(Acc0, Zm0, Bm, Acc0);
+        simdgroup_multiply_accumulate(Acc1, Zm1, Bm, Acc1);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_store(Acc0, tg_z + simd * 8u, 72u);
+    simdgroup_store(Acc1, tg_z + 8u * 72u + simd * 8u, 72u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr float INV_S = 0.02946278254943948f;
+    const threadgroup float4* tz4 = (const threadgroup float4*)tg_z;
+    ((device half4*)(out + (ulong)slot * 1152u))[tid] = half4(tz4[tid] * INV_S);
+    """
+    return mx.fast.metal_kernel(
+        name="ink_nv_skip_swiglu_rht1152_sg8_h",
+        input_names=["y_gu", "signs", "B", "caps", "eids", "exp_fid"],
+        output_names=["out", "raw_out"],
+        header="#include <metal_simdgroup_matrix>\n",
+        source=src,
+    )
+
+
+def fast_nv_skip_swiglu_rht1152_f16(
+    y_gu: mx.array,
+    signs: mx.array,
+    eids_flat: mx.array,
+    exp_fid: mx.array,
+    gate_cap: float = 4.0,
+    up_cap: float = 25.0,
+) -> tuple[mx.array, mx.array]:
+    """Compute `(act_rot, act_raw)` for mixed NVFP4 `dn` layers at `T <= 8`, skipping RHT on NVFP4 slots."""
+    n_slots = int(y_gu.shape[0])
+    caps = _fk._f32_arr(gate_cap, 1.0 / gate_cap, up_cap, 1.0 / up_cap)
+    use_sg8 = n_slots >= 64
+    tg_x = 288 if use_sg8 else 128
+    kern = make_nv_skip_swiglu_rht1152_f16_kernel(use_sg8=use_sg8)
+    outs = kern(
+        inputs=[
+            y_gu.reshape(-1),
+            signs.reshape(-1),
+            _fk._paley_b_flat(1152),
+            caps,
+            eids_flat.astype(mx.uint32),
+            exp_fid.astype(mx.uint32),
+        ],
+        grid=(tg_x, n_slots, 1),
+        threadgroup=(tg_x, 1, 1),
+        output_shapes=[(n_slots, 1152), (n_slots, 1152)],
+        output_dtypes=[mx.float16, mx.float16],
+    )
+    return outs[0], outs[1]
+
+

@@ -86,13 +86,15 @@ def _trim_sliding_slots_in_place(cache: Any) -> Any:
     return cache
 
 
-def _clone_cache_for_store(cache: Any, *, share_global: bool) -> Any:
+def _clone_cache_for_store(cache: Any, *, share_global: bool, defer_global: bool = False) -> Any:
     """Clone `cache` for PromptCache storage.
 
     When `share_global=True` (storing a non-pinned chat snapshot at `n - 1` right before the final token and
     generation), share the append-only global KV buffers (`kv_u8`, `kv_q4_sc`, non-sliding `kv_f16`) zero-copy
     and only deep-copy the small fixed-size sliding-window KV buffers (`W=1024`) and 3-tap `conv_states`.
-    This saves ~0.8-2.0 GB of duplicate global KV memory throughout generation.
+    When `defer_global=True` (while `cache` is still actively being appended to during the final prompt token
+    or mid-turn `pre_tool_gen`), store `None` for non-sliding global KV slots until `finalize_post_gen` attaches
+    them — keeping `cache.kv_u8` `refcount == 1` so MLX slice updates never trigger Copy-on-Write clones!
     """
     if (
         not share_global
@@ -105,14 +107,15 @@ def _clone_cache_for_store(cache: Any, *, share_global: bool) -> Any:
     new.__dict__.update(cache.__dict__)
     n_slots = len(cache.keys)
     cp = lambda a: None if a is None else mx.array(a)  # noqa: E731
+    gl = (lambda a: None) if defer_global else (lambda a: a)  # noqa: E731
     new.keys = [cp(a) for a in cache.keys]
     new.values = [cp(a) for a in cache.values]
-    new.kv_f16 = [cp(a) if cache.kv_is_sliding[s] else a for s, a in enumerate(cache.kv_f16)]
-    new.kv_u8 = [cp(a) if cache.kv_is_sliding[s] else a for s, a in enumerate(cache.kv_u8)]
-    new.kv_q4_sc = [cp(a) if cache.kv_is_sliding[s] else a for s, a in enumerate(cache.kv_q4_sc)]
+    new.kv_f16 = [cp(a) if cache.kv_is_sliding[s] else gl(a) for s, a in enumerate(cache.kv_f16)]
+    new.kv_u8 = [cp(a) if cache.kv_is_sliding[s] else gl(a) for s, a in enumerate(cache.kv_u8)]
+    new.kv_q4_sc = [cp(a) if cache.kv_is_sliding[s] else gl(a) for s, a in enumerate(cache.kv_q4_sc)]
     new.kv_len = list(cache.kv_len)
     new.kv_start = list(cache.kv_start)
-    new.kv_cap = list(cache.kv_cap)
+    new.kv_cap = [int(cache.kv_cap[s]) if (cache.kv_is_sliding[s] or not defer_global) else 0 for s in range(n_slots)]
     new.kv_is_sliding = list(cache.kv_is_sliding)
     new.conv_states = [[cp(a) for a in row] for row in cache.conv_states]
     new._spec_base_kv_len = list(cache._spec_base_kv_len)
@@ -125,18 +128,22 @@ def _clone_cache_for_store(cache: Any, *, share_global: bool) -> Any:
     return new
 
 
-def _clone_drafter_for_store(drafter: Any, *, share_global: bool) -> Any:
+def _clone_drafter_for_store(drafter: Any, *, share_global: bool, defer_global: bool = False) -> Any:
     if drafter is None:
         return None
     if not share_global or not hasattr(drafter, "ctx_k") or not hasattr(drafter, "local_layers"):
         return drafter.context_state()
     cp = lambda a: None if a is None else mx.array(a)  # noqa: E731
+    gl = (lambda a: None) if defer_global else (lambda a: a)  # noqa: E731
     local = drafter.local_layers
     st = {
-        "ctx_k": [cp(a) if i in local else a for i, a in enumerate(drafter.ctx_k)],
-        "ctx_v": [cp(a) if i in local else a for i, a in enumerate(drafter.ctx_v)],
+        "ctx_k": [cp(a) if i in local else gl(a) for i, a in enumerate(drafter.ctx_k)],
+        "ctx_v": [cp(a) if i in local else gl(a) for i, a in enumerate(drafter.ctx_v)],
         "_ctx_cur": list(drafter._ctx_cur),
-        "_ctx_cap": list(drafter._ctx_cap),
+        "_ctx_cap": [
+            int(drafter._ctx_cap[i]) if (i in local or not defer_global) else 0
+            for i in range(len(drafter._ctx_cap))
+        ],
         "ctx_len": drafter.ctx_len,
         "f_rnn": cp(drafter.f_rnn),
     }
@@ -183,7 +190,7 @@ def _apply_inplace_rollback(hit: dict[str, Any], cache: Any, drafter: Any, snap:
         cache.kv_start = list(snap["kv_start"])
         cache.conv_states = snap["conv_states"]
     hit["cache"] = cache
-    if drafter is not None and "drafter" in snap and isinstance(hit.get("drafter"), dict):
+    if drafter is not None and "drafter" in snap and hasattr(drafter, "ctx_k"):
         ds = snap["drafter"]
         for i, a in ds["ctx_k_local"].items():
             drafter.ctx_k[i] = a
@@ -290,8 +297,23 @@ class SmartPromptCache(_gen.PromptCache):
                 return True
         return False
 
+    def _flush_active_gen_global_buffers(self) -> None:
+        """Attach deferred global KV buffers from `_active_gen` to `entry` and `pre_tool_gen` once writing finishes."""
+        ag = self._active_gen
+        if not isinstance(ag, dict):
+            return
+        entry = ag.get("entry")
+        cache = ag.get("cache")
+        drafter = ag.get("drafter")
+        if isinstance(entry, dict) and cache is not None:
+            _sync_shared_global_buffers(entry.get("cache"), entry.get("drafter"), cache, drafter)
+            pt = entry.get("pre_tool_gen")
+            if isinstance(pt, dict):
+                _sync_shared_global_buffers(pt.get("cache"), pt.get("drafter"), cache, drafter)
+
     def _match(self, ids: list[int], drafting: bool) -> dict[str, Any] | None:
         """Match the longest cached prefix across `post_gen`, `pre_tool_gen`, and base prompt snapshots."""
+        self._flush_active_gen_global_buffers()
         best: dict[str, Any] | None = None
         best_tier = "base"
         best_len = 0
@@ -382,17 +404,19 @@ class SmartPromptCache(_gen.PromptCache):
         gen_committed = [int(t) for t in ngram_idx.tokens[prompt_len:-1]]
         if len(gen_committed) < 32:
             return
-        _sync_shared_global_buffers(entry["cache"], entry["drafter"], cache, drafter)
+        # Defer global KV buffer attachment until `finalize_post_gen` so `cache.kv_u8` keeps `refcount == 1`
+        # throughout tool-JSON generation (0 MB Copy-on-Write!).
         entry["pre_tool_gen"] = {
             "tokens": list(key_ids) + gen_committed,
-            "cache": _clone_cache_for_store(cache, share_global=True),
-            "drafter": _clone_drafter_for_store(drafter, share_global=True),
+            "cache": _clone_cache_for_store(cache, share_global=True, defer_global=True),
+            "drafter": _clone_drafter_for_store(drafter, share_global=True, defer_global=True),
             "gen_toks": len(gen_committed),
         }
 
     def finalize_post_gen(self, ngram_idx: Any) -> None:
         """Attach the post-generation KV cache + drafter state to the active chat entry (0 MB extra Global KV)."""
         self._cached_ngram_idx = ngram_idx
+        self._flush_active_gen_global_buffers()
         ag = self._active_gen
         self._active_gen = None
         if not isinstance(ag, dict):
@@ -412,12 +436,9 @@ class SmartPromptCache(_gen.PromptCache):
         gen_committed = [int(t) for t in ngram_idx.tokens[prompt_len:-1]]
         if not gen_committed:
             return
-        _sync_shared_global_buffers(entry["cache"], entry["drafter"], cache, drafter)
         pt = entry.get("pre_tool_gen")
-        if isinstance(pt, dict):
-            _sync_shared_global_buffers(pt.get("cache"), pt.get("drafter"), cache, drafter)
-            if len(pt.get("tokens", ())) == len(key_ids) + len(gen_committed):
-                entry["pre_tool_gen"] = None
+        if isinstance(pt, dict) and len(pt.get("tokens", ())) == len(key_ids) + len(gen_committed):
+            entry["pre_tool_gen"] = None
         entry["post_gen"] = {
             "tokens": list(key_ids) + gen_committed,
             "cache": _clone_cache_for_store(cache, share_global=True),
@@ -553,6 +574,7 @@ class SmartPromptCache(_gen.PromptCache):
         *,
         pinned: bool = False,
         min_tok: int | None = None,
+        defer_global: bool = False,
     ) -> dict[str, Any] | None:
         thresh = (self.pin_min_tokens if pinned else self.min_tokens) if min_tok is None else min_tok
         if self.max_entries <= 0 or len(tokens) < thresh:
@@ -562,8 +584,8 @@ class SmartPromptCache(_gen.PromptCache):
         share_global = not pinned
         entry = {
             "tokens": list(tokens),
-            "cache": _clone_cache_for_store(cache, share_global=share_global),
-            "drafter": _clone_drafter_for_store(drafter, share_global=share_global),
+            "cache": _clone_cache_for_store(cache, share_global=share_global, defer_global=defer_global),
+            "drafter": _clone_drafter_for_store(drafter, share_global=share_global, defer_global=defer_global),
             "used": self._clock,
             "pinned": pinned,
             "post_gen": None,
@@ -660,6 +682,7 @@ class SmartPromptCache(_gen.PromptCache):
             self.clear()
             self._owner = owner
 
+        self._flush_active_gen_global_buffers()
         self._active_gen = None
         if self.max_entries >= 2 and not any(e.get("pinned") for e in self._entries):
             self._try_load_pinned_from_disk(m, key_ids, drafting, drafter)
@@ -750,6 +773,9 @@ class SmartPromptCache(_gen.PromptCache):
                     else:
                         drafter.restore_context(st)
                 rollback_snap = _save_inplace_rollback(cache, drafter)
+                if drafting and isinstance(hit.get("drafter"), dict):
+                    # Release hit["drafter"] references to global ctx_k/ctx_v so drafter.ctx_k keeps refcount == 1!
+                    hit["drafter"] = None
                 self.log_fn(f"[cache] HIT {start}/{n} tok ({kind}, in-place +{n - start} tok)")
             else:
                 cache = hit["cache"].clone()
@@ -811,7 +837,17 @@ class SmartPromptCache(_gen.PromptCache):
                 if drafting:
                     drafter.push_context(taps, start_pos=taps_start)
                 rollback_snap = None
-                stored_chat = self._store(key_ids[: n - 1], cache, drafter, pinned=False, min_tok=eff_min)
+                stored_chat = self._store(
+                    key_ids[: n - 1], cache, drafter, pinned=False, min_tok=eff_min, defer_global=True
+                )
+                if stored_chat is not None:
+                    self._active_gen = {
+                        "entry": stored_chat,
+                        "key_ids": list(key_ids),
+                        "prompt_len": n,
+                        "cache": cache,
+                        "drafter": drafter,
+                    }
                 start = n - 1
 
             if not should_store_chat and start < n - 1:
@@ -838,6 +874,7 @@ class SmartPromptCache(_gen.PromptCache):
                     "drafter": drafter,
                 }
         except BaseException:
+            self._flush_active_gen_global_buffers()
             self._active_gen = None
             if move_hit and hit is not None and rollback_snap is not None:
                 _apply_inplace_rollback(hit, cache, drafter, rollback_snap)
