@@ -205,7 +205,7 @@ def message_char_count(messages: Any) -> int:
     return total
 
 
-def exceeds_char_budget(tot_chars: int, ctx: int, max_chars_per_token: int = 10) -> bool:
+def exceeds_char_budget(tot_chars: int, ctx: int, max_chars_per_token: int = 7) -> bool:
     """Return True when `tot_chars` is guaranteed to overflow `ctx` tokens (rejects before BPE)."""
     return int(ctx) > 0 and int(tot_chars) >= int(ctx) * int(max_chars_per_token)
 

@@ -2141,9 +2141,9 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
             ctx = {"prompt_cache": pc, "ngram_idx": None, "eos_ids": eos_set}
             _stream_tls.ctx = ctx
             # Exact SpecInfer stochastic tree verification (temp > 0) + hybrid N-gram||DSpark 4-3 tree + Token Recycling.
-            # LAMQ_STOCHASTIC_TREE="auto" (default): adaptive 4-3 stochastic tree <-> 8-token chain;
-            # set to "4-3" (or any TREE_TOPOLOGIES key) to force fixed tree, or "0"/"off" for stock 1D chain.
-            st_tree = os.environ.get("LAMQ_STOCHASTIC_TREE", "auto").strip()
+            # Opt-in via LAMQ_STOCHASTIC_TREE="4-3" or "auto" (default OFF: on 12.8GB + shared-global-KV long contexts,
+            # stock 1D `cur_block=6->8` avoids `T=8` overhead and non-contiguous `commit_tree_verify` KV copies).
+            st_tree = os.environ.get("LAMQ_STOCHASTIC_TREE", "").strip()
             temp_val = float(kwargs.get("temp", 0.0) or 0.0)
             explicit_tree = kwargs.get("tree")
             no_margin = float(kwargs.get("max_logit_gap", 0.0) or 0.0) == 0.0 and kwargs.get("min_prob_ratio") is None

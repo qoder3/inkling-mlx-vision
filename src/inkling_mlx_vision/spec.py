@@ -602,7 +602,7 @@ def stream_dspark_ext(
                 branch_a = None
                 hsrc = None
                 if use_hybrid and ngram_idx is not None:
-                    hb = ngram_idx.propose(anchor, max_draft=5, min_cont=4, eos=eos, min_n=3)
+                    hb = ngram_idx.propose(anchor, max_draft=5, min_cont=4, eos=eos, min_n=4)
                     if hb is not None and len(hb) == 5:
                         branch_a, hsrc = hb, "ngram"
                 if branch_a is None and recycler is not None:

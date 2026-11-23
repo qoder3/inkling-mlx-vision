@@ -33,15 +33,17 @@ def test_utf8_byte_bound_pre_tokenization_gate():
     assert cnt > 600
     assert not server.exceeds_char_budget(cnt, ctx=131072)
 
-    giant = [{"role": "user", "content": "a" * (131072 * 10)}]
+    # 1.0M chars (~330K-400K tokens of code/JSON) must be rejected before BPE at 131K context (ctx * 7 = 917K)
+    giant = [{"role": "user", "content": "a" * (131072 * 7)}]
     assert server.exceeds_char_budget(server.message_char_count(giant), ctx=131072)
+    assert not server.exceeds_char_budget(131072 * 6, ctx=131072)
 
     # Normalized dict tool arguments must also trigger the gate (not len(dict) == 1!)
     giant_tool = [
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"function": {"name": "edit", "arguments": {"payload": "z" * (131072 * 10)}}}],
+            "tool_calls": [{"function": {"name": "edit", "arguments": {"payload": "z" * (131072 * 7)}}}],
         }
     ]
     assert server.exceeds_char_budget(server.message_char_count(giant_tool), ctx=131072)
