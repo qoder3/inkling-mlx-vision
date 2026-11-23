@@ -1060,6 +1060,28 @@ def drafter_gqa_sdpa_fast(q: mx.array, K_buf: mx.array, V_buf: mx.array, lo: int
 # --------------------------------------------------------------------------- Custom Metal Kernel 4: Exact Radix-Histogram Top-P
 
 
+# Compatibility shim: on stock Apple GPUCompiler toolchains (e.g. GPUCompiler 32023.886 on
+# M1 Pro), `threadgroup atomic<float>` fails to compile ("cannot pass pointer to address
+# space 'threadgroup' as a pointer to address space 'device'"), while uint atomics in
+# threadgroup storage are fine. Emulate exact float fetch-add with a relaxed CAS loop on
+# the IEEE-754 bit pattern (same atomicity/order semantics, same parity vs mx.argsort).
+_TOPP_UINT_ATOMICS_HEADER = """
+inline uint tgu_load(threadgroup atomic_uint* a) {
+    return atomic_load_explicit(a, memory_order_relaxed);
+}
+inline void tgu_store(threadgroup atomic_uint* a, uint v) {
+    atomic_store_explicit(a, v, memory_order_relaxed);
+}
+inline float tgf_add(threadgroup atomic_uint* a, float x) {
+    uint prev = atomic_load_explicit(a, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(
+        a, &prev, as_type<uint>(as_type<float>(prev) + x),
+        memory_order_relaxed, memory_order_relaxed)) {}
+    return as_type<float>(prev);
+}
+"""
+
+
 @lru_cache(maxsize=4)
 def make_exact_topp_probs_kernel(nt: int = 1024):
     """Exact 3-pass IEEE-754 radix-histogram nucleus (`top_p`) Metal kernel — zero 200K sort, zero CPU sync.
@@ -1104,10 +1126,10 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
     const float inv_sum = 1.0f / max(rsum, 1e-38f);
 
     // 2. Write normalized probs + Pass-1 1024-bin radix histogram (bits 29..20; skips ultra-tiny tail atomics unless needed)
-    threadgroup atomic<float> h_sum[1024];
+    threadgroup atomic_uint h_sum[1024];  // holds IEEE-754 bits of the float sum (CAS-emulated float atomics)
     threadgroup atomic_uint h_cnt[1024];
     for (uint b = tid; b < 1024u; b += {nt}u) {{
-        atomic_store_explicit(&h_sum[b], 0.0f, memory_order_relaxed);
+        tgu_store(&h_sum[b], 0u);
         atomic_store_explicit(&h_cnt[b], 0u, memory_order_relaxed);
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1121,7 +1143,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
         if (p > 0.0f) {{
             uint bin = min(1023u, as_type<uint>(p) >> 20);
             if (bin >= 800u) {{
-                atomic_fetch_add_explicit(&h_sum[bin], p, memory_order_relaxed);
+                tgf_add(&h_sum[bin], p);
                 atomic_fetch_add_explicit(&h_cnt[bin], 1u, memory_order_relaxed);
             }}
         }}
@@ -1139,7 +1161,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
         uint found = 0u, found_cnt = 0u, hit = 0u;
         float found_sum = 0.0f;
         for (int b = 1023; b >= 800; b--) {{
-            float hs = atomic_load_explicit(&h_sum[b], memory_order_relaxed);
+            float hs = as_type<float>(tgu_load(&h_sum[b]));
             uint hc = atomic_load_explicit(&h_cnt[b], memory_order_relaxed);
             if (hc > 0u) {{
                 if (cum + hs >= top_p) {{
@@ -1164,7 +1186,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
             if (p > 0.0f) {{
                 uint bin = min(1023u, as_type<uint>(p) >> 20);
                 if (bin < 800u) {{
-                    atomic_fetch_add_explicit(&h_sum[bin], p, memory_order_relaxed);
+                    tgf_add(&h_sum[bin], p);
                     atomic_fetch_add_explicit(&h_cnt[bin], 1u, memory_order_relaxed);
                 }}
             }}
@@ -1177,7 +1199,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
             uint last_b = 0u, last_cnt = 0u;
             float last_sum = 0.0f;
             for (int b = 799; b >= 0; b--) {{
-                float hs = atomic_load_explicit(&h_sum[b], memory_order_relaxed);
+                float hs = as_type<float>(tgu_load(&h_sum[b]));
                 uint hc = atomic_load_explicit(&h_cnt[b], memory_order_relaxed);
                 if (hc > 0u) {{
                     last_b = (uint)b; last_cnt = hc; last_sum = hs;
@@ -1200,7 +1222,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
     // Pass 2 (bits 19..10)
     if (tg_done == 0u) {{
         for (uint b = tid; b < 1024u; b += {nt}u) {{
-            atomic_store_explicit(&h_sum[b], 0.0f, memory_order_relaxed);
+            tgu_store(&h_sum[b], 0u);
             atomic_store_explicit(&h_cnt[b], 0u, memory_order_relaxed);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1210,7 +1232,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
             uint bits = as_type<uint>(p);
             if ((bits >> 20) == pfx) {{
                 uint bin = (bits >> 10) & 1023u;
-                atomic_fetch_add_explicit(&h_sum[bin], p, memory_order_relaxed);
+                tgf_add(&h_sum[bin], p);
                 atomic_fetch_add_explicit(&h_cnt[bin], 1u, memory_order_relaxed);
             }}
         }}
@@ -1222,7 +1244,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
             uint last_b = 0u, last_cnt = 0u;
             float last_sum = 0.0f;
             for (int b = 1023; b >= 0; b--) {{
-                float hs = atomic_load_explicit(&h_sum[b], memory_order_relaxed);
+                float hs = as_type<float>(tgu_load(&h_sum[b]));
                 uint hc = atomic_load_explicit(&h_cnt[b], memory_order_relaxed);
                 if (hc > 0u) {{
                     last_b = (uint)b; last_cnt = hc; last_sum = hs;
@@ -1245,7 +1267,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
     // Pass 3 (bits 9..0)
     if (tg_done == 0u) {{
         for (uint b = tid; b < 1024u; b += {nt}u) {{
-            atomic_store_explicit(&h_sum[b], 0.0f, memory_order_relaxed);
+            tgu_store(&h_sum[b], 0u);
             atomic_store_explicit(&h_cnt[b], 0u, memory_order_relaxed);
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1255,7 +1277,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
             uint bits = as_type<uint>(p);
             if ((bits >> 10) == pfx) {{
                 uint bin = bits & 1023u;
-                atomic_fetch_add_explicit(&h_sum[bin], p, memory_order_relaxed);
+                tgf_add(&h_sum[bin], p);
                 atomic_fetch_add_explicit(&h_cnt[bin], 1u, memory_order_relaxed);
             }}
         }}
@@ -1267,7 +1289,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
             uint last_b = 0u, last_cnt = 0u;
             float last_sum = 0.0f;
             for (int b = 1023; b >= 0; b--) {{
-                float hs = atomic_load_explicit(&h_sum[b], memory_order_relaxed);
+                float hs = as_type<float>(tgu_load(&h_sum[b]));
                 uint hc = atomic_load_explicit(&h_cnt[b], memory_order_relaxed);
                 if (hc > 0u) {{
                     last_b = (uint)b; last_cnt = hc; last_sum = hs;
@@ -1298,6 +1320,7 @@ def make_exact_topp_probs_kernel(nt: int = 1024):
         input_names=["logits", "meta", "params"],
         output_names=["probs"],
         source=src,
+        header=_TOPP_UINT_ATOMICS_HEADER,
     )
 
 
