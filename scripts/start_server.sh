@@ -1,11 +1,25 @@
 #!/usr/bin/env zsh
 set -euo pipefail
 
-# Portable launcher for inkling-mlx-serve (override defaults via env vars or CLI flags).
+# Portable launcher for inkling-mlx-serve (override defaults via .inkling.env, env vars, or CLI flags).
+SCRIPT_DIR="${0:A:h}"
+REPO_DIR="${SCRIPT_DIR:h}"
+if [[ -f "${REPO_DIR}/.inkling.env" ]]; then
+  set -a
+  source "${REPO_DIR}/.inkling.env"
+  set +a
+fi
+
 MODEL_VARIANT="${MODEL_VARIANT:-8.9GB}"
 MODEL="${INKLING_MODEL:-shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-${MODEL_VARIANT}}"
 DRAFTER="${INKLING_DRAFTER:-shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter}"
-VISION="${INKLING_VISION:-./vision_tower.safetensors}"
+if [[ -n "${INKLING_VISION:-}" ]]; then
+  VISION="${INKLING_VISION}"
+elif [[ -f "./vision_tower.safetensors" ]]; then
+  VISION="./vision_tower.safetensors"
+else
+  VISION="${REPO_DIR}/vision_tower.safetensors"
+fi
 HOST="${INKLING_HOST:-127.0.0.1}"
 PORT="${INKLING_PORT:-8080}"
 CONTEXT="${INKLING_CONTEXT:-131072}"
@@ -74,7 +88,15 @@ if [[ -n "${DRAFTER}" ]]; then
   DRAFTER_FLAGS=(--drafter "${DRAFTER}")
 fi
 
-exec inkling-mlx-serve \
+SERVE_BIN="inkling-mlx-serve"
+if [[ -x "${REPO_DIR}/.venv/bin/inkling-mlx-serve" ]]; then
+  SERVE_BIN="${REPO_DIR}/.venv/bin/inkling-mlx-serve"
+elif ! command -v inkling-mlx-serve >/dev/null 2>&1; then
+  echo "inkling-mlx-serve not found in PATH or ${REPO_DIR}/.venv/bin. Run ./install.sh first." >&2
+  exit 1
+fi
+
+exec "${SERVE_BIN}" \
   "${MODEL}" \
   "${DRAFTER_FLAGS[@]}" \
   "${VISION_FLAGS[@]}" \

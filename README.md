@@ -93,20 +93,48 @@ Out of the box, `lookatmyquant`'s `lamq serve` already delivered remarkable comp
 
 ## Quickstart
 
-Requires **macOS on Apple Silicon (M1/M2/M3/M4)** and **Python 3.11+**.
+Requires **macOS on Apple Silicon (M1/M2/M3/M4)**.
 
-### 1. Install
+### One-Command Install (Recommended)
+
+Installs `uv` (if needed), creates an isolated Python 3.12 `.venv`, installs `lookatmyquant` + `inkling-mlx-vision`, extracts the 637 MB `vision_tower.safetensors` via HTTP Range, auto-selects the right quant for your Mac's Unified Memory (`8.9GB` on 16–24 GB Macs, `12.8GB` on 32+ GB Macs), and installs the `inkling-server` launcher:
+
+```zsh
+curl -fsSL https://raw.githubusercontent.com/qoder3/inkling-mlx-vision/main/install.sh | bash
+```
+
+Optional flags (pass after `bash -s --`):
+
+```zsh
+# Pick the 100% BF16-fidelity 12.8GB build and start the server immediately:
+curl -fsSL https://raw.githubusercontent.com/qoder3/inkling-mlx-vision/main/install.sh | bash -s -- --variant 12.8GB --start
+
+# Other useful flags: --dir PATH, --port 8080, --kv fp8|q4, --no-vision, --run-tests, --dry-run
+```
+
+Then start (or restart) anytime without activating a virtualenv:
+
+```zsh
+inkling-server --restart
+# or: ~/inkling-mlx-vision/scripts/start_server.sh --restart
+```
+
+<details>
+<summary><strong>Manual Step-by-Step Install</strong></summary>
+
+#### 1. Install
 
 ```zsh
 git clone https://github.com/qoder3/inkling-mlx-vision.git
 cd inkling-mlx-vision
+./install.sh   # or run the commands below manually:
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install "git+https://github.com/ShinMegamiBoson/lookatmyquant.git"
 uv pip install -e .
 ```
 
-### 2. Extract `vision_tower.safetensors` (~637 MB)
+#### 2. Extract `vision_tower.safetensors` (~637 MB)
 
 Downloads **only** the 637 MB vision weights from Hugging Face via HTTP Range requests (skips the 16.9 GB LLM shards):
 
@@ -120,7 +148,7 @@ inkling-extract-vision -o vision_tower.safetensors
 inkling-extract-vision --from-local /path/to/Inkling-2-Mini-oQ4e-mtp -o vision_tower.safetensors
 ```
 
-### 3. Start the Server
+#### 3. Start the Server
 
 ```zsh
 LAMQ_GLOBAL_KV=fp8 inkling-mlx-serve \
@@ -130,19 +158,21 @@ LAMQ_GLOBAL_KV=fp8 inkling-mlx-serve \
   --host 127.0.0.1 --port 8080 \
   --model-id inkling-2-mini \
   --context 131072 --max-tokens 16384 \
-  --prompt-cache 3 --prefill-chunk 256 \
+  --prompt-cache 3 --prefill-chunk 512 \
   --reasoning-effort medium --temp 0.6 --top-p 0.95
 ```
 
-Or use the included launcher script (supports `--restart` and env overrides like `LAMQ_GLOBAL_KV=q4` for ultra-long 64K–128K sessions):
+Or use the included launcher script (auto-detects `.venv`, supports `--restart`, `.inkling.env`, and env overrides like `MODEL_VARIANT=12.8GB` or `LAMQ_GLOBAL_KV=q4`):
 
 ```zsh
 ./scripts/start_server.sh --restart
 ```
 
+</details>
+
 On startup you should see:
 ```text
-metal accel enabled: GQA-SG8 Split-K SDPA + GQA-FA2 prefill + O(N) KV(4096) + M4-Pro-16c tuning=on
+metal accel enabled: GQA-SG8 SDPA + GQA-FA2 + DSpark-GQA12 SDPA + Radix-TopP + MoE-v4-Fused=on + Ngram=on + O(N) KV(4096) + M4-Pro-16c=on
 vision enabled: ./vision_tower.safetensors (636.6 MB BF16, lazy on-demand mmap)
 serving 'inkling-2-mini' on http://127.0.0.1:8080/v1
 ```

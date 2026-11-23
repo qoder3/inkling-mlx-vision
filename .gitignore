@@ -15,6 +15,7 @@ build/
 .mypy_cache/
 .ruff_cache/
 
-# Logs & OS files
+# Logs, local config & OS files
+.inkling.env
 *.log
 .DS_Store
