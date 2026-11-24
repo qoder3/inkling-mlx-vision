@@ -467,6 +467,32 @@ def _env_flag(name: str, default: str) -> bool:
     return os.environ.get(name, default) not in ("0", "", "false", "False")
 
 
+def select_adaptive_draft_block(ewma_accept: float, ctx_len: int = 0, max_block: int = 8) -> int:
+    """Select optimal 1D speculative verify block size `T in {3, 4, 6, 8}` (`drafts = T - 1`) to maximize `a / step_ms`.
+
+    Derived from the MoE routed-expert union law `1 - (1 - top_k / E)^T` (`sybil-solutions/inference-optimisation-skill`):
+    - At `T = 6` (`5` drafts), 48 visits load 32.1% of the 23.19 GB expert pool (`7.45 GB`, `~71 ms/step` on M4 Pro).
+    - At `T = 4` (`3` drafts), 48 visits load 22.8% of experts (`5.29 GB`, `~55.7 ms/step`, `-21.5%` step time).
+    - At `T = 3` (`2` drafts), 48 visits load 17.6% of experts (`4.08 GB`, `~48.4 ms/step`, `-31.8%` step time).
+    - At long context (`ctx_len >= 49152`), caps `T` one tier lower (`<= 6`) to bound multi-query SDPA KV bandwidth.
+    """
+    max_b = max(2, int(max_block))
+    ewma = float(ewma_accept)
+    if int(ctx_len) >= 49152:
+        if ewma >= 3.6:
+            return min(6, max_b)
+        if ewma >= 2.2:
+            return min(4, max_b)
+        return min(3, max_b)
+    if ewma >= 3.6:
+        return max_b
+    if ewma >= 2.45:
+        return min(6, max_b)
+    if ewma >= 1.45:
+        return min(4, max_b)
+    return min(3, max_b)
+
+
 _UNSET: Any = object()
 
 
@@ -852,12 +878,21 @@ def stream_dspark_ext(
                 dspark_rounds += 1
                 ewma_accept = 0.7 * ewma_accept + 0.3 * len(raw)
                 if adaptive:
+                    use_4tier = _env_flag("LAMQ_ADAPTIVE_DRAFT_BLOCK", "1")
+                    if use_4tier and len(raw) >= 2:
+                        serial_burst_len = 4
                     if tree_spec is None and fixed_block is None:
-                        cur_block = drafter.block_size if ewma_accept >= 3.6 else min(6, drafter.block_size)
-                    if dspark_rounds >= 5 and ewma_accept < 1.35:
+                        if use_4tier:
+                            cur_block = select_adaptive_draft_block(
+                                ewma_accept, getattr(cache, "seq_len", 0), drafter.block_size
+                            )
+                        else:
+                            cur_block = drafter.block_size if ewma_accept >= 3.6 else min(6, drafter.block_size)
+                    serial_thr = 1.24 if use_4tier else 1.35
+                    if dspark_rounds >= 5 and ewma_accept < serial_thr:
                         serial_cooldown = serial_burst_len
-                        serial_burst_len = min(16, serial_burst_len * 2)
-                        ewma_accept = 2.0
+                        serial_burst_len = min(8 if use_4tier else 16, serial_burst_len * 2)
+                        ewma_accept = 1.95 if use_4tier else 2.0
 
             k_a = 0
             if round_source == "hybrid" and accepted_path is not None:

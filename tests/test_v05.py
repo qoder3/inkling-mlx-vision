@@ -808,3 +808,17 @@ def test_v054_build_hybrid_quant_dir_symlinks_and_luts_merge(tmp_path):
         assert set(merged.files) == {"nvfp4", "rtr1", "rtr2", "rtr4"}
 
 
+def test_v055_select_adaptive_draft_block_4tier_and_long_context():
+    # Normal context (< 48K): 4 tiers {3, 4, 6, 8}
+    assert spec.select_adaptive_draft_block(1.20, ctx_len=4096, max_block=8) == 3
+    assert spec.select_adaptive_draft_block(1.85, ctx_len=4096, max_block=8) == 4
+    assert spec.select_adaptive_draft_block(2.80, ctx_len=4096, max_block=8) == 6
+    assert spec.select_adaptive_draft_block(4.20, ctx_len=4096, max_block=8) == 8
+
+    # Long context (>= 48K): shifts down one tier {3, 4, 6} to bound multi-query SDPA KV bandwidth
+    assert spec.select_adaptive_draft_block(1.85, ctx_len=65536, max_block=8) == 3
+    assert spec.select_adaptive_draft_block(2.80, ctx_len=65536, max_block=8) == 4
+    assert spec.select_adaptive_draft_block(4.20, ctx_len=65536, max_block=8) == 6
+
+
+

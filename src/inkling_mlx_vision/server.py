@@ -651,6 +651,36 @@ def install_patches(cfg: ServerConfig) -> None:
             self.m._vision_ctx = None
 
     _server.Engine._run = _instrumented_run
+    if hasattr(_server.Engine, "warmup"):
+        orig_warmup = _server.Engine.warmup
+
+        def _multi_shape_warmup(self) -> None:
+            """Pre-compile Metal kernels for Radix-TopP (`top_p < 1.0`), 46K Multilingual Draft Head, and `T in {3, 4, 6}`."""
+            t = time.perf_counter()
+            for temp, tp in ((0.0, 1.0), (0.6, 0.95)):
+                job = self.prepare(
+                    {
+                        "messages": [{"role": "user", "content": "Say OK."}],
+                        "max_tokens": 4,
+                        "temperature": temp,
+                        "top_p": tp,
+                    }
+                )
+                job["use_cache"] = False
+                self.run(job, lambda *a: None, lambda: False)
+            if getattr(self, "drafter", None) is not None:
+                from runtime_mlx.inkling import generate as _gen_w
+
+                p_w = self.prepare({"messages": [{"role": "user", "content": "OK"}], "max_tokens": 4})["ids"]
+                for dl in (3, 4):
+                    for _ in _gen_w.stream_dspark(
+                        self.m, self.drafter, p_w, max_tokens=dl, draft_len=dl, adaptive=False, temp=0.6, top_p=0.95
+                    ):
+                        pass
+            mx.clear_cache()
+            log_fn(f"warmup {time.perf_counter() - t:.1f}s (T=1,3,4,6 + Radix-TopP + 46K DraftHead)")
+
+        _server.Engine.warmup = _multi_shape_warmup
     _server.make_handler = _queue_mod.make_queued_handler_factory(_server.make_handler, log_fn)
 
 

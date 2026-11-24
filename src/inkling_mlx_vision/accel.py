@@ -2497,6 +2497,15 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                 if st_tree == "auto":
                     kwargs["adaptive_tree"] = True
                 gen = stream_dspark_ext(*args, **kwargs)
+            elif (
+                explicit_tree is None
+                and kwargs.get("draft_len") is None
+                and kwargs.get("adaptive", True)
+                and os.environ.get("LAMQ_ADAPTIVE_DRAFT_BLOCK", "1") != "0"
+            ):
+                from .spec import stream_dspark_ext
+
+                gen = stream_dspark_ext(*args, **kwargs)
             else:
                 gen = orig_stream_dspark(*args, **kwargs)
             try:
