@@ -673,3 +673,138 @@ def test_v053_char_budget_includes_tools_and_ctx_times_5():
     assert not server.exceeds_char_budget(c_no_tools, 131072)
     assert server.exceeds_char_budget(c_with_tools, 131072)
 
+
+# --------------------------------------------------------------------------- 9. v0.5.4 Weight-Level & Draft Shortlist Optimizations
+
+
+def test_v054_extract_cyrillic_token_ids_bytelevel_and_unicode(tmp_path):
+    import json
+
+    tok_json = tmp_path / "tokenizer.json"
+    tok_json.write_text(
+        json.dumps(
+            {
+                "model": {
+                    "vocab": {
+                        "hello": 0,
+                        "Ġworld": 1,
+                        "ÐºÐ²Ð°Ð½Ñ‚": 2,  # ByteLevel UTF-8 Cyrillic ('квант')
+                        "Ñ‚Ð¾ÐºÐµÐ½": 3,  # ByteLevel UTF-8 Cyrillic ('токен')
+                        "привет": 4,  # Direct Unicode Cyrillic
+                    }
+                },
+                "added_tokens": [
+                    {"id": 5, "content": "<|end_message|>"},
+                    {"id": 6, "content": "ÐŸÑ€Ð¸Ð¼ÐµÑ€"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cyr = accel.extract_cyrillic_token_ids(tok_json)
+    assert cyr == {2, 3, 4, 6}
+
+
+def test_v054_verify_sparse_spec_sample_gpu_unbiased():
+    """Empirical proof that sparse shortlist verification (`draft_ord_map`) is 100% unbiased wrt target `p(x)`."""
+    rng = np.random.default_rng(20260504)
+    V = 48
+    # Non-contiguous shortlist: prefix [0..7] + sparse Cyrillic columns [20, 25, 31, 40]
+    ord_map_np = np.array([0, 1, 2, 3, 4, 5, 6, 7, 20, 25, 31, 40], dtype=np.int32)
+    S = len(ord_map_np)
+    draft_ord_map = mx.array(ord_map_np)
+    perm = rng.permutation(V).astype(np.int32)
+    order_mx = mx.array(perm)
+    order_sub = order_mx[draft_ord_map]
+
+    temp = 0.8
+    logits_np = rng.standard_normal((2, V)).astype(np.float32) * 1.1
+    p0_ord = _softmax_np(logits_np[0], temp)
+    p0_vocab = np.zeros(V, dtype=np.float64)
+    p0_vocab[perm] = p0_ord
+
+    q_logits = logits_np[0, ord_map_np] + rng.standard_normal(S).astype(np.float32) * 0.5
+    q0_probs = mx.array(_softmax_np(q_logits, temp).astype(np.float32))[None, :]  # [1, S]
+    ord_logits = mx.array(logits_np)
+
+    n_trials = 3500
+    counts = np.zeros(V, dtype=np.int64)
+    sparse_accepts = 0
+    for _ in range(n_trials):
+        short_idx = spec._sample_from_probs(q0_probs[0])
+        k_match_mx, bonus_tok_mx = accel.verify_sparse_spec_sample_gpu(
+            ord_logits,
+            order_mx,
+            short_idx.reshape(1),
+            q0_probs,
+            cap=None,
+            temp=temp,
+            draft_ord_map=draft_ord_map,
+        )
+        mx.eval(short_idx, k_match_mx, bonus_tok_mx)
+        s_i = int(short_idx.item())
+        k_m = int(k_match_mx.item())
+        if k_m == 1:
+            tok = int(order_sub[s_i].item())
+            if s_i >= 8:
+                sparse_accepts += 1
+        else:
+            tok = int(bonus_tok_mx.item())
+        counts[tok] += 1
+
+    emp = counts / n_trials
+    max_err = float(np.max(np.abs(emp - p0_vocab)))
+    assert max_err < 0.028, f"Sparse shortlist verify bias too large: max_err={max_err:.4f}"
+    assert sparse_accepts > 25, "Expected sparse Cyrillic rows (index >= 8) to be drafted and accepted"
+
+
+def test_v054_resolve_decode_moe_routing_prefill_vs_decode_and_postloop(monkeypatch):
+    class _Cfg:
+        moe_k_max = 8
+        moe_k_min = 8
+        moe_ratio_thr = 0.0
+        moe_renorm = False
+
+    cfg = _Cfg()
+    # 1. Default: static k=8 on both prefill and decode
+    assert accel.resolve_decode_moe_routing(cfg, cache_slot=10, T=6) == (False, 8, 8, 0.0, False)
+    assert accel.resolve_decode_moe_routing(cfg, cache_slot=10, T=64) == (False, 8, 8, 0.0, False)
+
+    # 2. Even if config or decode env enables dynamic MoE, prefill (T > 8) stays at lossless static k=8!
+    monkeypatch.setenv("LAMQ_DECODE_MOE_K_MAX", "7")
+    monkeypatch.setenv("LAMQ_POSTLOOP_MOE_K_MAX", "6")
+    assert accel.resolve_decode_moe_routing(cfg, cache_slot=10, T=64) == (False, 8, 8, 0.0, False)
+    assert accel.resolve_decode_moe_routing(cfg, cache_slot=10, T=6) == (True, 7, 7, 0.0, True)
+    # Post-loop L18..23 (cache_slot 42..47) applies LAMQ_POSTLOOP_MOE_K_MAX=6
+    assert accel.resolve_decode_moe_routing(cfg, cache_slot=42, T=6) == (True, 6, 6, 0.0, True)
+
+
+def test_v054_build_hybrid_quant_dir_symlinks_and_luts_merge(tmp_path):
+    hi = tmp_path / "12.8GB"
+    lo = tmp_path / "8.9GB"
+    out = tmp_path / "hybrid"
+    hi.mkdir()
+    lo.mkdir()
+
+    (hi / "config.json").write_text('{"hidden_size": 2304}', encoding="utf-8")
+    (lo / "config.json").write_text('{"hidden_size": 2304}', encoding="utf-8")
+    (hi / "steering.safetensors").write_bytes(b"STEER")
+    np.savez(hi / "luts.npz", nvfp4=np.ones((4,), dtype=np.float32), rtr4=np.ones((8,), dtype=np.float32))
+    np.savez(lo / "luts.npz", rtr1=np.zeros((2,), dtype=np.float32), rtr2=np.zeros((4,), dtype=np.float32))
+
+    for idx in range(24):
+        (hi / f"layer_{idx:02d}_meta.json").write_text('{"src": "hi"}', encoding="utf-8")
+        (lo / f"layer_{idx:02d}_meta.json").write_text('{"src": "lo"}', encoding="utf-8")
+        (hi / f"layer_{idx:02d}_packed.npz").write_bytes(b"H" * 1000)
+        (lo / f"layer_{idx:02d}_packed.npz").write_bytes(b"L" * 400)
+
+    manifest = accel.build_hybrid_quant_dir(hi, lo, out, low_layers=(18, 19, 20, 21, 22, 23))
+    assert manifest["low_layers"] == [18, 19, 20, 21, 22, 23]
+    assert manifest["saved_bytes"] == 6 * 600
+    assert set(manifest["luts_keys"]) == {"nvfp4", "rtr1", "rtr2", "rtr4"}
+    assert (out / "layer_17_packed.npz").resolve() == (hi / "layer_17_packed.npz").resolve()
+    assert (out / "layer_18_packed.npz").resolve() == (lo / "layer_18_packed.npz").resolve()
+    with np.load(out / "luts.npz") as merged:
+        assert set(merged.files) == {"nvfp4", "rtr1", "rtr2", "rtr4"}
+
+

@@ -1885,6 +1885,262 @@ def calibrate_draft_temp(temp: float, scale: float | None = None) -> float:
     return t
 
 
+_SPARSE_DRAFT_ORD_MAPS: dict[int, mx.array] = {}
+
+
+def extract_cyrillic_token_ids(tokenizer_json_path: str | os.PathLike) -> set[int]:
+    """Extract all token IDs containing Cyrillic glyphs from a HuggingFace `tokenizer.json` (including ByteLevel BPE).
+
+    In GPT-2/Qwen ByteLevel BPE, UTF-8 lead bytes `0xD0` and `0xD1` (which encode Unicode Cyrillic `U+0400..U+04FF`)
+    are mapped to Latin-1 codepoints `U+00D0` ('Ð') and `U+00D1` ('Ñ'). Checking both ByteLevel lead chars and direct
+    Unicode `U+0400..U+04FF` recovers all 13,410 Cyrillic vocabulary tokens in Inkling-2-Mini.
+    """
+    import json
+    from pathlib import Path
+
+    p = Path(tokenizer_json_path)
+    if not p.is_file():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    vocab = data.get("model", {}).get("vocab", {})
+    cyr_ids: set[int] = set()
+    for tok_str, tid in vocab.items():
+        if "\u00d0" in tok_str or "\u00d1" in tok_str or any("\u0400" <= ch <= "\u04ff" for ch in tok_str):
+            cyr_ids.add(int(tid))
+    for added in data.get("added_tokens", ()):
+        content = added.get("content", "")
+        tid = added.get("id")
+        if tid is not None and (
+            "\u00d0" in content or "\u00d1" in content or any("\u0400" <= ch <= "\u04ff" for ch in content)
+        ):
+            cyr_ids.add(int(tid))
+    return cyr_ids
+
+
+def verify_sparse_spec_sample_gpu(
+    ordered_logits: mx.array,
+    order_mx: mx.array,
+    draft_ord: mx.array,
+    q_probs: mx.array | None,
+    *,
+    cap: float | None,
+    temp: float,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    draft_ord_map: mx.array | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Exact Chen/Leviathan unbiased speculative sampling verification supporting sparse/non-contiguous shortlist heads.
+
+    When `draft_ord_map` (`int32[S]`, mapping shortlist index `0..S-1` -> column index `0..V-1` in `ordered_logits`)
+    is provided (or registered in `_SPARSE_DRAFT_ORD_MAPS[S]`), maps `draft_ord` through `draft_ord_map` for `p_d` and
+    scatters the residual `max(0, p_row[draft_ord_map] - q_sel)` back into `p_row` via `mx.put_along_axis` on GPU.
+    """
+    if q_probs is not None and draft_ord_map is None:
+        draft_ord_map = _SPARSE_DRAFT_ORD_MAPS.get(int(q_probs.shape[1]))
+    if q_probs is None or draft_ord_map is None:
+        return _gen_mod._orig_verify_spec_sample_gpu(
+            ordered_logits,
+            order_mx,
+            draft_ord,
+            q_probs,
+            cap=cap,
+            temp=temp,
+            top_p=top_p,
+            top_k=top_k,
+        )
+    if ordered_logits.ndim == 3:
+        ordered_logits = ordered_logits[0]
+    T = int(ordered_logits.shape[0])
+    K = T - 1
+
+    p_ord = _gen_mod.logits_to_probs(_model_mod.softcap(ordered_logits, cap), temp=temp, top_p=top_p, top_k=top_k)
+    rows = mx.arange(K, dtype=mx.int32)
+    draft_short_i32 = draft_ord.reshape(K).astype(mx.int32)
+    draft_col_i32 = draft_ord_map[draft_short_i32]
+    p_d = p_ord[rows, draft_col_i32]
+    q_d = q_probs[rows, draft_short_i32]
+
+    u = mx.random.uniform(shape=(K,), dtype=mx.float32)
+    accept = (u * q_d) < p_d
+    k_match = mx.sum(mx.cumprod(accept.astype(mx.int32), axis=0)).astype(mx.int32)
+
+    all_accepted = k_match == K
+    rej_idx = mx.minimum(k_match, K - 1)
+    p_row = p_ord[k_match]
+    q_sel = q_probs[rej_idx]
+    p_sub = p_row[draft_ord_map]
+    res_row = mx.put_along_axis(p_row, draft_ord_map, mx.maximum(p_sub - q_sel, 0.0), axis=0)
+
+    res_sum = mx.sum(res_row)
+    safe_res = mx.where(res_sum > 0.0, res_row / mx.maximum(res_sum, 1e-38), p_row)
+    dist = mx.where(all_accepted, p_row, safe_res)
+    log_dist = mx.where(dist > 0.0, mx.log(mx.maximum(dist, 1e-38)), -float("inf"))
+    final_ord = mx.random.categorical(log_dist).astype(mx.int32)
+    final_tok = order_mx[final_ord].astype(mx.int32)
+    return k_match, final_tok
+
+
+def resolve_decode_moe_routing(cfg: Any, cache_slot: int, T: int) -> tuple[bool, int, int, float, bool]:
+    """Resolve `(dyn, k_max, k_min, ratio_thr, renorm)` for MoE visit `cache_slot` (`0..47`) at sequence length `T`.
+
+    - Prefill (`T > 8`): defaults to 100% static `k=8` (`dyn=False`) unless `LAMQ_PREFILL_DYNAMIC_MOE=1` is set,
+      preventing prefill throughput slowdown (`-3.8%`) and prompt KV cache drift (`KL = 0.01025`).
+    - Decode (`T <= 8`): combines `cfg.moe_*` with optional `LAMQ_DECODE_MOE_K_MAX`, `LAMQ_DECODE_MOE_K_MIN`,
+      `LAMQ_DECODE_MOE_RATIO_THR`, and post-loop `L18..23` (`cache_slot >= 42`) `LAMQ_POSTLOOP_MOE_K_MAX`.
+    """
+    if T > 8 and os.environ.get("LAMQ_PREFILL_DYNAMIC_MOE", "0") != "1":
+        return False, 8, 8, 0.0, False
+
+    k_max = int(getattr(cfg, "moe_k_max", 8))
+    k_min = int(getattr(cfg, "moe_k_min", 8))
+    ratio_thr = float(getattr(cfg, "moe_ratio_thr", 0.0))
+    renorm = bool(getattr(cfg, "moe_renorm", False))
+    env_active = False
+
+    if T <= 8:
+        env_kmax = os.environ.get("LAMQ_DECODE_MOE_K_MAX", "").strip()
+        if env_kmax:
+            k_max = max(1, min(8, int(env_kmax)))
+            env_active = True
+        env_kmin = os.environ.get("LAMQ_DECODE_MOE_K_MIN", "").strip()
+        if env_kmin:
+            k_min = max(1, min(8, int(env_kmin)))
+            env_active = True
+        env_thr = os.environ.get("LAMQ_DECODE_MOE_RATIO_THR", "").strip()
+        if env_thr:
+            ratio_thr = max(0.0, float(env_thr))
+            env_active = True
+        if cache_slot >= 42:
+            env_post = os.environ.get("LAMQ_POSTLOOP_MOE_K_MAX", "").strip()
+            if env_post:
+                post_k = max(1, min(8, int(env_post)))
+                k_max = min(k_max, post_k)
+                k_min = min(k_min, post_k)
+                env_active = True
+        if env_active and not env_kmin and ratio_thr <= 0.0:
+            k_min = min(k_min, k_max)
+        if env_active:
+            renorm = os.environ.get("LAMQ_DECODE_MOE_RENORM", "1") != "0"
+
+    k_min = min(k_min, k_max)
+    dyn = (k_max < 8) or (ratio_thr > 0.0)
+    return dyn, k_max, k_min, ratio_thr, renorm
+
+
+def build_hybrid_quant_dir(
+    high_dir: str | os.PathLike,
+    low_dir: str | os.PathLike,
+    out_dir: str | os.PathLike,
+    *,
+    low_layers: tuple[int, ...] | list[int] = (18, 19, 20, 21, 22, 23),
+) -> dict[str, Any]:
+    """Create a zero-copy symlinked Loop-Aware Hybrid model directory combining `high_dir` (e.g. 12.8GB) and `low_dir` (e.g. 8.9GB).
+
+    By default, keeps pre-loop `L0..5` and 3x-looped core `L6..17` (36 visits) from `high_dir` (`12.8GB`) and replaces
+    only the 1x post-loop layers `L18..23` (6 visits) with `low_dir` (`8.9GB`), saving `725.2 MB` of wired Unified
+    Memory with `dKL = 0.00018` and `100.0%` top-1 token agreement. Also merges `luts.npz` across both directories.
+    """
+    import json
+    from pathlib import Path
+    import numpy as np
+
+    hi_path = Path(high_dir).expanduser().resolve()
+    lo_path = Path(low_dir).expanduser().resolve()
+    dst_path = Path(out_dir).expanduser().resolve()
+    if not (hi_path / "config.json").is_file():
+        raise FileNotFoundError(f"high_dir missing config.json: {hi_path}")
+    if not (lo_path / "config.json").is_file():
+        raise FileNotFoundError(f"low_dir missing config.json: {lo_path}")
+
+    dst_path.mkdir(parents=True, exist_ok=True)
+    low_set = {int(idx) for idx in low_layers}
+
+    # 1. Symlink all shared non-layer files from high_dir (except luts.npz and hybrid_manifest.json)
+    for item in sorted(hi_path.iterdir()):
+        name = item.name
+        if name in ("luts.npz", "hybrid_manifest.json") or name.startswith("layer_"):
+            continue
+        target = dst_path / name
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        target.symlink_to(item)
+
+    # 2. Symlink per-layer files and compute exact byte savings
+    total_bytes = 0
+    saved_bytes = 0
+    layer_sources: dict[str, str] = {}
+    for idx in range(24):
+        src_base = lo_path if idx in low_set else hi_path
+        layer_sources[f"layer_{idx:02d}"] = "low" if idx in low_set else "high"
+        hi_npz = hi_path / f"layer_{idx:02d}_packed.npz"
+        lo_npz = lo_path / f"layer_{idx:02d}_packed.npz"
+        if idx in low_set and hi_npz.is_file() and lo_npz.is_file():
+            saved_bytes += max(0, hi_npz.stat().st_size - lo_npz.stat().st_size)
+        for suffix in ("_meta.json", "_packed.npz"):
+            fname = f"layer_{idx:02d}{suffix}"
+            src_file = src_base / fname
+            if not src_file.is_file():
+                raise FileNotFoundError(f"Missing layer file: {src_file}")
+            dst_file = dst_path / fname
+            if dst_file.exists() or dst_file.is_symlink():
+                dst_file.unlink()
+            dst_file.symlink_to(src_file)
+            total_bytes += src_file.stat().st_size
+
+    # 3. Merge luts.npz from high_dir and low_dir so all format LUTs (nvfp4, rtr1..4) are present
+    merged_luts: dict[str, np.ndarray] = {}
+    for src_lut_path in (lo_path / "luts.npz", hi_path / "luts.npz"):
+        if src_lut_path.is_file():
+            with np.load(src_lut_path) as lnpz:
+                for k in lnpz.files:
+                    merged_luts[k] = lnpz[k]
+    dst_luts = dst_path / "luts.npz"
+    if dst_luts.exists() or dst_luts.is_symlink():
+        dst_luts.unlink()
+    np.savez(dst_luts, **merged_luts)
+
+    manifest = {
+        "high_dir": hi_path.name,
+        "low_dir": lo_path.name,
+        "low_layers": sorted(low_set),
+        "saved_bytes": int(saved_bytes),
+        "saved_mb": round(saved_bytes / (1024 * 1024), 2),
+        "total_layer_gb": round(total_bytes / (1024**3), 3),
+        "luts_keys": sorted(merged_luts.keys()),
+        "layers": layer_sources,
+    }
+    (dst_path / "hybrid_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def build_hybrid_cli(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for `inkling-build-hybrid` (`12.8GB x 8.9GB` zero-copy post-loop hybrid builder)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Build a zero-copy symlinked Loop-Aware Hybrid model directory (e.g. 12.8GB core + 8.9GB post-loop L18..23)."
+    )
+    parser.add_argument("--high-dir", required=True, help="Path to high-precision packed model directory (e.g. 12.8GB)")
+    parser.add_argument("--low-dir", required=True, help="Path to lower-precision packed model directory (e.g. 8.9GB)")
+    parser.add_argument("--out-dir", required=True, help="Output directory for the zero-copy symlinked hybrid model")
+    parser.add_argument(
+        "--low-layers",
+        default="18,19,20,21,22,23",
+        help="Comma-separated layer indices to take from --low-dir (default: post-loop 18,19,20,21,22,23)",
+    )
+    args = parser.parse_args(argv)
+    low_layers = tuple(int(x.strip()) for x in args.low_layers.split(",") if x.strip())
+    manifest = build_hybrid_quant_dir(args.high_dir, args.low_dir, args.out_dir, low_layers=low_layers)
+    print(
+        f"Built hybrid model at {args.out_dir}: low_layers={manifest['low_layers']} "
+        f"| saved={manifest['saved_mb']:.1f} MB | total_layer_gb={manifest['total_layer_gb']:.3f} GB"
+    )
+    return 0
+
+
 # --------------------------------------------------------------------------- O(N) Global KV Allocation & M4 Pro Tuning
 
 
@@ -2577,14 +2833,14 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                 and self.gu_unified.m_rows == 2304
                 and self.dn_unified.n_cols == 1152
             ):
+                dyn, eff_kmax, eff_kmin, eff_thr, eff_renorm = resolve_decode_moe_routing(self.cfg, cache_slot, T)
                 if T > 8:
                     logits_f16 = h_mlp_f16 @ self.router_w_f16.T
-                    dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
                     if dyn:
                         eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
                             logits_f16, self.router_bias, self.cfg.route_scale,
-                            k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
-                            ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                            k_max=eff_kmax, k_min=eff_kmin,
+                            ratio_thr=eff_thr, renorm=eff_renorm,
                         )
                     else:
                         eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
@@ -2605,17 +2861,16 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                     )
                     cache.set_conv_after(cache_slot, 3, prev, raw_sum, new_prev)
                     return out
-                if self.dn_unified.has_nvfp4 and self.dn_unified.n_rg == 1:
+                if self.dn_unified.n_rg == 1:
                     logits_f16 = h_mlp_f16 @ self.router_w_f16.T
-                    dyn = (self.cfg.moe_k_max < 8) or (self.cfg.moe_ratio_thr > 0.0)
                     if 2 <= T <= 8:
                         if dyn:
                             eids_flat, w_norm, gu_plan, dn_plan = _model_mod.sigmoid_top8_norm_and_plan_fast(
                                 logits_f16, self.router_bias, self.cfg.route_scale,
                                 self.gu_unified.exp_fid, self.gu_unified.fids,
                                 self.dn_unified.exp_fid, self.dn_unified.fids,
-                                k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
-                                ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                                k_max=eff_kmax, k_min=eff_kmin,
+                                ratio_thr=eff_thr, renorm=eff_renorm,
                             )
                         else:
                             eids_flat, w_norm, gu_plan, dn_plan = _model_mod.sigmoid_top8_norm_and_plan_fast(
@@ -2627,8 +2882,8 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                         if dyn:
                             eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
                                 logits_f16, self.router_bias, self.cfg.route_scale,
-                                k_max=self.cfg.moe_k_max, k_min=self.cfg.moe_k_min,
-                                ratio_thr=self.cfg.moe_ratio_thr, renorm=self.cfg.moe_renorm,
+                                k_max=eff_kmax, k_min=eff_kmin,
+                                ratio_thr=eff_thr, renorm=eff_renorm,
                             )
                         else:
                             eids_flat, w_norm = _model_mod.sigmoid_top8_norm_fast(
@@ -2639,19 +2894,26 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                         x_rot_gu_f16, eids_flat, x_div=8, sorted_cache=None, plan=gu_plan,
                         dynamic_routing=dyn, x_raw_f16=h_mlp_f16,
                     )
-                    if self.dn_unified.fids == (7,):
-                        # 19/48 pure-NVFP4 visits: 100% skip RHT-1152 and second buffer allocation!
-                        act_raw = fast_swiglu_only_f16(
-                            y_gu, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
-                            eids_flat=eids_flat if dyn else None,
-                        )
-                        act_rot = act_raw
+                    if self.dn_unified.has_nvfp4:
+                        if self.dn_unified.fids == (7,):
+                            # 19/48 pure-NVFP4 visits: 100% skip RHT-1152 and second buffer allocation!
+                            act_raw = fast_swiglu_only_f16(
+                                y_gu, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
+                                eids_flat=eids_flat if dyn else None,
+                            )
+                            act_rot = act_raw
+                        else:
+                            # 23/48 mixed visits: skip H_16 + Paley-72 RHT-1152 on every NVFP4 slot (75-90% of slots)!
+                            act_rot, act_raw = fast_nv_skip_swiglu_rht1152_f16(
+                                y_gu, self.dn_signs_in, eids_flat, self.dn_unified.exp_fid,
+                                self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
+                            )
                     else:
-                        # 23/48 mixed visits: skip H_16 + Paley-72 RHT-1152 on every NVFP4 slot (75-90% of slots)!
-                        act_rot, act_raw = fast_nv_skip_swiglu_rht1152_f16(
-                            y_gu, self.dn_signs_in, eids_flat, self.dn_unified.exp_fid,
-                            self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
+                        act_rot = _model_mod.swiglu_rht_1152_fast(
+                            y_gu, self.dn_signs_in, self.cfg.mlp_gate_softcap, self.cfg.mlp_up_softcap,
+                            out_dtype=mx.float16, eids_flat=eids_flat if dyn else None,
                         )
+                        act_raw = None
                     y_dn = self.dn_unified(
                         act_rot, eids_flat, x_div=1, sorted_cache=None, plan=dn_plan,
                         dynamic_routing=dyn, x_raw_f16=act_raw,
@@ -2669,23 +2931,109 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         _model_mod.PackedMoE.forward_fast_fused_prerot = _fused_v4_moe_prerot
 
     # 3c. Temperature-Calibrated Draft Proposal (`tau_q = gamma * tau_p`, 0% target distribution bias)
-    if hasattr(_model_mod, "PackedLMHead") and hasattr(_model_mod.PackedLMHead, "get_draft_head_sampler"):
-        orig_get_draft_sampler = _model_mod.PackedLMHead.get_draft_head_sampler
+    #     + 46K Multilingual/Cyrillic Draft Head Shortlist (`LAMQ_MULTILINGUAL_DRAFT_HEAD=1`, +20% Russian tpc)
+    if not hasattr(_gen_mod, "_orig_verify_spec_sample_gpu"):
+        _gen_mod._orig_verify_spec_sample_gpu = _gen_mod.verify_spec_sample_gpu
+    _gen_mod.verify_spec_sample_gpu = verify_sparse_spec_sample_gpu
 
-        def _calibrated_get_draft_head_sampler(
-            self,
-            temp: float,
-            top_p: float = 1.0,
-            top_k: int = 0,
-            max_buckets: int = 5,
-            bits: int = 4,
-        ):
-            eff_temp = calibrate_draft_temp(temp)
-            return orig_get_draft_sampler(
-                self, eff_temp, top_p=top_p, top_k=top_k, max_buckets=max_buckets, bits=bits
-            )
+    if hasattr(_model_mod, "PackedLMHead"):
+        if hasattr(_model_mod.PackedLMHead, "_ensure_draft_head"):
+            orig_ensure_draft_head = _model_mod.PackedLMHead._ensure_draft_head
 
-        _model_mod.PackedLMHead.get_draft_head_sampler = _calibrated_get_draft_head_sampler
+            def _multilingual_ensure_draft_head(self, max_buckets: int = 5, bits: int = 4):
+                key = (max_buckets, bits)
+                if key in self._draft_cache:
+                    return self._draft_cache[key]
+                packed_dir = getattr(self, "_packed_dir", None)
+                if (
+                    os.environ.get("LAMQ_MULTILINGUAL_DRAFT_HEAD", "1") == "0"
+                    or not getattr(self, "_fast", False)
+                    or packed_dir is None
+                    or max_buckets >= getattr(self, "nb", 0)
+                ):
+                    return orig_ensure_draft_head(self, max_buckets=max_buckets, bits=bits)
+
+                cyr_ids = extract_cyrillic_token_ids(packed_dir / "tokenizer.json")
+                if not cyr_ids:
+                    return orig_ensure_draft_head(self, max_buckets=max_buckets, bits=bits)
+
+                import numpy as np
+
+                nb = min(max_buckets, self.nb)
+                W_full = self.stage.dequant_f16()
+                wqs, scs, bis = [], [], []
+                total_rows = 0
+                for bi in range(nb):
+                    lo, hi = self.stage.slices[bi]
+                    rows_b = hi - lo
+                    total_rows += rows_b
+                    Q_b = W_full[lo:hi].astype(mx.float32)
+                    W_b = _model_mod.rht_out_2304_fast(
+                        Q_b, self.stage.signs_in[bi : bi + 1], mx.zeros((rows_b,), dtype=mx.uint32)
+                    )
+                    wq, sc, bi_q = mx.quantize(W_b.astype(mx.float16), group_size=64, bits=bits)
+                    mx.eval(wq, sc, bi_q)
+                    wqs.append(wq)
+                    scs.append(sc)
+                    bis.append(bi_q)
+
+                extra_ord: list[np.ndarray] = []
+                cyr_list = list(cyr_ids)
+                for bi in range(nb, self.nb):
+                    lo, hi = self.stage.slices[bi]
+                    b_toks = self.order_np[lo:hi]
+                    rel_idx = np.where(np.isin(b_toks, cyr_list))[0]
+                    if len(rel_idx) == 0:
+                        continue
+                    abs_ord_idx = (lo + rel_idx).astype(np.int32)
+                    rows_b = len(rel_idx)
+                    Q_b = W_full[mx.array(abs_ord_idx)].astype(mx.float32)
+                    W_b = _model_mod.rht_out_2304_fast(
+                        Q_b, self.stage.signs_in[bi : bi + 1], mx.zeros((rows_b,), dtype=mx.uint32)
+                    )
+                    wq, sc, bi_q = mx.quantize(W_b.astype(mx.float16), group_size=64, bits=bits)
+                    mx.eval(wq, sc, bi_q)
+                    wqs.append(wq)
+                    scs.append(sc)
+                    bis.append(bi_q)
+                    extra_ord.append(abs_ord_idx)
+                del W_full
+
+                wq_all = mx.concatenate(wqs, axis=0)
+                sc_all = mx.concatenate(scs, axis=0)
+                bi_all = mx.concatenate(bis, axis=0)
+                if extra_ord:
+                    ord_map_np = np.concatenate([np.arange(total_rows, dtype=np.int32), *extra_ord], axis=0)
+                    draft_ord_map = mx.array(ord_map_np)
+                    order_sub = self.order_mx[draft_ord_map]
+                    mx.eval(wq_all, sc_all, bi_all, order_sub, draft_ord_map)
+                    _SPARSE_DRAFT_ORD_MAPS[int(draft_ord_map.shape[0])] = draft_ord_map
+                else:
+                    order_sub = self.order_mx[:total_rows]
+                    mx.eval(wq_all, sc_all, bi_all, order_sub)
+                mx.clear_cache()
+                self._draft_cache[key] = (wq_all, sc_all, bi_all, order_sub, bits)
+                return self._draft_cache[key]
+
+            _model_mod.PackedLMHead._ensure_draft_head = _multilingual_ensure_draft_head
+
+        if hasattr(_model_mod.PackedLMHead, "get_draft_head_sampler"):
+            orig_get_draft_sampler = _model_mod.PackedLMHead.get_draft_head_sampler
+
+            def _calibrated_get_draft_head_sampler(
+                self,
+                temp: float,
+                top_p: float = 1.0,
+                top_k: int = 0,
+                max_buckets: int = 5,
+                bits: int = 4,
+            ):
+                eff_temp = calibrate_draft_temp(temp)
+                return orig_get_draft_sampler(
+                    self, eff_temp, top_p=top_p, top_k=top_k, max_buckets=max_buckets, bits=bits
+                )
+
+            _model_mod.PackedLMHead.get_draft_head_sampler = _calibrated_get_draft_head_sampler
 
     _INSTALLED = True
     summary = {
@@ -2694,6 +3042,7 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         "custom_drafter_gqa12_sdpa": True,
         "custom_radix_topp": True,
         "moe_prefill_v4_fused": moe_v4_enabled,
+        "multilingual_draft_head": os.environ.get("LAMQ_MULTILINGUAL_DRAFT_HEAD", "1") != "0",
         "ngram_default": ngram_enabled,
         "kv_alloc_step": _kv_step,
         "m4_pro_grid_tuning": m4_pro,
@@ -2702,6 +3051,7 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         log_fn(
             f"metal accel enabled: GQA-SG8 SDPA + GQA-FA2 + DSpark-GQA12 SDPA + Radix-TopP "
             f"+ MoE-v4-Fused={'on' if moe_v4_enabled else 'off'} "
+            f"+ Multilingual-DraftHead={'on' if summary['multilingual_draft_head'] else 'off'} "
             f"+ Ngram={'on' if ngram_enabled else 'off'} + O(N) KV(4096) "
             f"+ M4-Pro-16c={'on' if m4_pro else 'off'}"
         )

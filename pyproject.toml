@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inkling-mlx-vision"
-version = "0.5.3"
+version = "0.5.4"
 description = "Native MLX Vision Tower, custom Metal SDPA/M4-Pro kernels, and Agent-IDE OpenAI server for LookAtMyQuant Inkling-2-Mini"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -41,6 +41,7 @@ Issues = "https://github.com/qoder3/inkling-mlx-vision/issues"
 [project.scripts]
 inkling-mlx-serve = "inkling_mlx_vision.server:main"
 inkling-extract-vision = "inkling_mlx_vision.extract:main"
+inkling-build-hybrid = "inkling_mlx_vision.accel:build_hybrid_cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/inkling_mlx_vision"]
