@@ -924,5 +924,215 @@ def test_v056_set_postloop_ant_tier_hot_swap(tmp_path):
     assert all(m.layers[i].source == hi.name for i in range(24))
 
 
+def test_v057_prenorm_block_attn_res_exact_parity():
+    from runtime_mlx.inkling.fast_kernels import block_attn_res_fused, block_attn_res_norm_rht_fast
+
+    mx.random.seed(20260507)
+    H = 2304
+    q1 = mx.random.normal((H,))
+    q3 = mx.random.normal((3, H))
+    norm_w = mx.random.normal((H,))
+    gu_signs = mx.where(mx.random.uniform(shape=(H,)) > 0.5, 1.0, -1.0).astype(mx.float32)
+
+    for T in (1, 4, 6):
+        partial = mx.random.normal((T, H)) * 3.5
+        for n_b in (0, 1, 3, 4):
+            if n_b == 0:
+                b_raw = None
+                b_hat = None
+            else:
+                b_raw = mx.random.normal((n_b, T, H)) * 5.0
+                b_hat = mx.fast.rms_norm(b_raw, None, 1e-6)
+
+            out_st0 = block_attn_res_fused(q3, b_raw, n_b, partial)
+            out_pr0 = accel.block_attn_res_prenorm_fused(q3, b_hat, n_b, partial)
+            out_st1 = block_attn_res_fused(q1, b_raw, n_b, partial, norm_w=norm_w)
+            out_pr1 = accel.block_attn_res_prenorm_fused(q1, b_hat, n_b, partial, norm_w=norm_w)
+            h_st, r_st = block_attn_res_norm_rht_fast(q1, b_raw, n_b, partial, norm_w, gu_signs)
+            h_pr, r_pr = accel.block_attn_res_prenorm_norm_rht_fast(q1, b_hat, n_b, partial, norm_w, gu_signs)
+            mx.eval(out_st0, out_pr0, out_st1, out_pr1, h_st, r_st, h_pr, r_pr)
+
+            assert float(mx.max(mx.abs(out_st0 - out_pr0)).item()) < 5e-6
+            assert float(mx.max(mx.abs(out_st1 - out_pr1)).item()) < 5e-6
+            assert float(mx.max(mx.abs(h_st.astype(mx.float32) - h_pr.astype(mx.float32))).item()) < 2e-3
+            assert float(mx.max(mx.abs(r_st.astype(mx.float32) - r_pr.astype(mx.float32))).item()) < 2e-3
+
+
+def test_v057_rank2_cross_loop_law_of_cosines_and_blend_parity():
+    from runtime_mlx.inkling.fast_kernels import (
+        block_attn_res_fused,
+        msg_blend_norm_3x_fused,
+        msg_blend_norm_rht_fast,
+    )
+    from runtime_mlx.inkling.model import (
+        _msg_1x_compiled,
+        _msg_3x_shared_h_compiled,
+        _msg_3x_split_h_compiled,
+    )
+
+    mx.random.seed(20260508)
+    H = 2304
+    u_q = mx.random.normal((12, 4, H)) * 0.5
+    u_ordered = mx.concatenate([u_q[:, :3, :].reshape(36, H), u_q[:, 3, :].reshape(12, H)], axis=0)
+
+    qkv_dh = (mx.random.normal((3, 64, H)) * 0.05).astype(mx.bfloat16)
+    qkv_dh_flat = qkv_dh.reshape(192, H)
+    qkv_dm = (mx.random.normal((3, 64, H)) * 0.05).astype(mx.bfloat16)
+    qkv_fm = (mx.random.normal((3, 4608, 64)) * 0.05).astype(mx.bfloat16)
+    mlp_dh = (mx.random.normal((64, H)) * 0.05).astype(mx.bfloat16)
+    mlp_dm = (mx.random.normal((64, H)) * 0.05).astype(mx.bfloat16)
+    mlp_fm = (mx.random.normal((4608, 64)) * 0.05).astype(mx.bfloat16)
+
+    # Replicate the same dm across 12 layers for table construction
+    all_dm_ordered = mx.concatenate(
+        [qkv_dm.reshape(192, H)] * 12 + [mlp_dm] * 12,
+        axis=0,
+    )
+    in_ln_shared = mx.ones((H,), dtype=mx.float32)
+    in_ln_split = mx.ones((3, H), dtype=mx.float32)
+    post_ln = mx.ones((H,), dtype=mx.float32)
+    gu_signs = mx.ones((H,), dtype=mx.float32)
+
+    for T in (1, 4):
+        v2_raw = mx.random.normal((1, T, H)) * 4.0
+        v2_hat = mx.fast.rms_norm(v2_raw[0], None, 1e-6)
+        v3_raw = mx.random.normal((T, H)) * 6.0
+        h_a_shared = mx.random.normal((T, H))
+        h_a_split = mx.random.normal((3, T, H))
+        h_m = mx.random.normal((T, H))
+
+        v2_h, v3_h, b3_flat, Z = accel.precompute_loop_pass_rank2(
+            v2_hat, v3_raw, u_ordered, all_dm_ordered, v2_is_prenorm=True
+        )
+        v2_1d, v3_1d = v2_h.reshape(-1), v3_h.reshape(-1)
+
+        for idx in (0, 5, 11):
+            msgs = block_attn_res_fused(u_q[idx], v2_raw, 1, v3_raw)
+            col0 = idx * 3
+            col_mlp = 36 + idx
+
+            # 1. Shared h (sliding layers)
+            fg3_st = _msg_3x_shared_h_compiled(h_a_shared, msgs[:3], qkv_dh, qkv_dm, qkv_fm)
+            qkv_st = msg_blend_norm_3x_fused(h_a_shared, msgs[:3], fg3_st, in_ln_shared, T, h_shared=True, norm_shared=True)
+            fg3_rk = accel._msg_3x_shared_h_rank2_compiled(h_a_shared, Z, qkv_dh_flat, qkv_fm, col0)
+            qkv_rk = accel.msg_blend_norm_3x_rank2(
+                h_a_shared, v2_1d, v3_1d, b3_flat, fg3_rk, in_ln_shared, T, h_shared=True, norm_shared=True, col0=col0
+            )
+
+            # 2. Split h (global layers)
+            fg3s_st = _msg_3x_split_h_compiled(h_a_split, msgs[:3], qkv_dh, qkv_dm, qkv_fm)
+            qkvs_st = msg_blend_norm_3x_fused(h_a_split, msgs[:3], fg3s_st, in_ln_split, T, h_shared=False, norm_shared=False)
+            fg3s_rk = accel._msg_3x_split_h_rank2_compiled(h_a_split, Z, qkv_dh, qkv_fm, col0)
+            qkvs_rk = accel.msg_blend_norm_3x_rank2(
+                h_a_split, v2_1d, v3_1d, b3_flat, fg3s_rk, in_ln_split, T, h_shared=False, norm_shared=False, col0=col0
+            )
+
+            # 3. MLP message blend + RHT
+            fg1_st = _msg_1x_compiled(h_m, msgs[3], mlp_dh, mlp_dm, mlp_fm)
+            hm_st, xr_st = msg_blend_norm_rht_fast(h_m, msgs[3], fg1_st, post_ln, gu_signs)
+            fg1_rk = accel._msg_1x_rank2_compiled(h_m, Z, mlp_dh, mlp_fm, col_mlp)
+            hm_rk, xr_rk = accel.msg_blend_norm_rht_rank2(
+                h_m, v2_1d, v3_1d, b3_flat, fg1_rk, post_ln, gu_signs, col=col_mlp
+            )
+
+            mx.eval(qkv_st, qkv_rk, qkvs_st, qkvs_rk, hm_st, hm_rk, xr_st, xr_rk)
+            assert float(mx.max(mx.abs(qkv_st - qkv_rk)).item()) < 5e-2
+            assert float(mx.max(mx.abs(qkvs_st - qkvs_rk)).item()) < 5e-2
+            assert float(mx.max(mx.abs(hm_st.astype(mx.float32) - hm_rk.astype(mx.float32))).item()) < 5e-2
+            assert float(mx.max(mx.abs(xr_st.astype(mx.float32) - xr_rk.astype(mx.float32))).item()) < 5e-2
+
+
+def test_v057_classify_cache_slot_and_beacon_protected_moe_routing(monkeypatch):
+    class _Cfg:
+        moe_k_max = 8
+        moe_k_min = 8
+        moe_ratio_thr = 0.0
+        moe_renorm = False
+
+    cfg = _Cfg()
+    # Verify slot classification across all 5 segments
+    assert accel.classify_inkling_cache_slot(5) == {
+        "cache_slot": 5, "layer_idx": 5, "loop_pass": -1, "block_idx": 0,
+        "is_postloop": False, "is_loop3": False, "is_beacon": True,
+    }
+    assert accel.classify_inkling_cache_slot(18) == {
+        "cache_slot": 18, "layer_idx": 18, "loop_pass": -2, "block_idx": 3,
+        "is_postloop": True, "is_loop3": False, "is_beacon": False,
+    }
+    assert accel.classify_inkling_cache_slot(41)["is_beacon"] is True
+    assert accel.classify_inkling_cache_slot(47)["is_beacon"] is True
+    assert accel.classify_inkling_cache_slot(42)["is_beacon"] is False
+
+    monkeypatch.setenv("LAMQ_POSTLOOP_MOE_K_MAX", "6")
+    # 1. Default Tap-41 Coherent mode: pre-tap41 Loop-3 Block-3 non-beacon slots (42..46) get k=6
+    for slot in (42, 43, 44, 45, 46):
+        assert accel.resolve_decode_moe_routing(cfg, cache_slot=slot, T=4) == (True, 6, 6, 0.0, True)
+    # 2. Critical Goodfire beacon tagging layers L5, L11, L17 (including Loop-3 slots 41 & 47) AND post-tap41 Coda (18..23) stay at k=8!
+    for protected_slot in (5, 11, 17, 18, 23, 29, 35, 41, 47):
+        assert accel.resolve_decode_moe_routing(cfg, cache_slot=protected_slot, T=4) == (False, 8, 8, 0.0, False)
+    # 3. Explicit LAMQ_CODA_MOE_K_MAX and LAMQ_LOOP3_MOE_K_MAX apply to Coda (18..23) and all 10 non-beacon Loop-3 slots
+    monkeypatch.setenv("LAMQ_CODA_MOE_K_MAX", "6")
+    monkeypatch.setenv("LAMQ_LOOP3_MOE_K_MAX", "6")
+    for slot in (18, 19, 20, 21, 22, 23, 36, 37, 38, 39, 40, 42, 43, 44, 45, 46):
+        assert accel.resolve_decode_moe_routing(cfg, cache_slot=slot, T=4) == (True, 6, 6, 0.0, True)
+    for beacon_slot in (5, 11, 17, 29, 35, 41, 47):
+        assert accel.resolve_decode_moe_routing(cfg, cache_slot=beacon_slot, T=4) == (False, 8, 8, 0.0, False)
+
+
+def test_v057_quantize_mtp_beacon_protected_and_auto_bits_qlinear(tmp_path):
+    from runtime_mlx.inkling import drafter as _drafter_mod
+
+    accel.install_metal_accelerations()
+    rng = np.random.default_rng(20260509)
+    H = 2304
+    # Create synthetic BF16 MTP weights (> 1 MB so quantizer processes them)
+    dflare_w = mx.array(rng.uniform(0.5, 5.0, size=(H,)).astype(np.float32)).astype(mx.bfloat16)
+    k_ctx_w = mx.array((rng.standard_normal((256, H)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    v_ctx_w = mx.array((rng.standard_normal((256, H)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    q_proj_w = mx.array((rng.standard_normal((256, H)) * 0.05).astype(np.float32)).astype(mx.bfloat16)
+    mask_emb = mx.array(rng.standard_normal((H,)).astype(np.float32)).astype(mx.bfloat16)
+
+    src_file = tmp_path / "mtp_src.safetensors"
+    dst_file = tmp_path / "mtp_beacon.safetensors"
+    mx.save_safetensors(
+        str(src_file),
+        {
+            "mask_embed": mask_emb,
+            "layers.0.dflare_norm.weight": dflare_w,
+            "layers.0.self_attn.k_proj_ctx.weight": k_ctx_w,
+            "layers.0.self_attn.v_proj_ctx.weight": v_ctx_w,
+            "layers.0.self_attn.q_proj.weight": q_proj_w,
+        },
+    )
+
+    stats = accel.quantize_mtp_beacon_protected(src_file, dst_file, group_size=64, bits=4, tap_bits=8)
+    assert stats["quantized_matrices"] == 3
+    assert stats["tap_protected_matrices"] == 2
+
+    loaded = mx.load(str(dst_file))
+    # Auto-bits _QLinear detects 8-bit on k_proj_ctx and 4-bit on q_proj automatically!
+    ql_k = _drafter_mod._QLinear(loaded, "layers.0.self_attn.k_proj_ctx.weight", bits=4, group_size=64)
+    ql_q = _drafter_mod._QLinear(loaded, "layers.0.self_attn.q_proj.weight", bits=4, group_size=64)
+    assert ql_k.bits == 8
+    assert ql_q.bits == 4
+
+    # Verify exact mathematical equivalence of AWQ folded dflare_norm * k_proj_ctx vs BF16 on beacon-outlier input
+    x_raw = rng.standard_normal((4, H)).astype(np.float32)
+    x_raw[:, 2027] = 32.4
+    x_mx = mx.array(x_raw)
+    ref_y = (x_mx * dflare_w.astype(mx.float32)).astype(mx.bfloat16) @ k_ctx_w.T
+    got_y = ql_k((x_mx * loaded["layers.0.dflare_norm.weight"].astype(mx.float32)).astype(mx.bfloat16))
+    wq4, sc4, bi4 = mx.quantize(k_ctx_w, group_size=64, bits=4)
+    y_q4 = mx.quantized_matmul(
+        (x_mx * dflare_w.astype(mx.float32)).astype(mx.bfloat16), wq4, sc4, bi4, transpose=True, group_size=64, bits=4
+    )
+    mx.eval(ref_y, got_y, y_q4)
+    rmse = float(mx.sqrt(mx.mean((ref_y.astype(mx.float32) - got_y.astype(mx.float32)) ** 2)).item())
+    rmse_q4 = float(mx.sqrt(mx.mean((ref_y.astype(mx.float32) - y_q4.astype(mx.float32)) ** 2)).item())
+    assert rmse < 0.08 and rmse < rmse_q4 * 0.12, f"Expected >8x RMSE reduction vs stock 4-bit ({rmse_q4:.4f}), got {rmse:.4f}"
+
+
+
+
 
 

@@ -1983,13 +1983,59 @@ def verify_sparse_spec_sample_gpu(
     return k_match, final_tok
 
 
+def classify_inkling_cache_slot(cache_slot: int) -> dict[str, Any]:
+    """Map an `Inkling2Cache` logical slot `cache_slot` (`0..47`) to its physical layer and loop role.
+
+    In `Inkling2LoopPackedMLX._forward_core_fast`:
+      - `0..5`:   Pre-loop Block 1 (`L0..5`, `loop_pass=-1`), beacon tagging layer at `L5` (`cache_slot=5`)
+      - `6..17`:  Loop Pass 0 (`L6..17`, `loop_pass=0`), beacon tagging layers at `L11, L17` (`cache_slot=11, 17`)
+      - `18..23`: Post-loop Coda Block 4 (`L18..23`, `loop_pass=-2`, logical visits `42..47`)
+      - `24..35`: Loop Pass 1 (`L6..17`, `loop_pass=1`), beacon tagging layers at `L11, L17` (`cache_slot=29, 35`)
+      - `36..47`: Loop Pass 2 (`L6..17`, `loop_pass=2`), beacon tagging layers at `L11, L17` (`cache_slot=41, 47`)
+
+    Because `18` and `30` are multiples of `6`, `(cache_slot % 6) == (layer_idx % 6)` holds for all 48 slots.
+    Per Goodfire's mechanistic analysis, the final layers of Blocks 1..3 (`L5, L11, L17`, i.e. `(cache_slot % 6) == 5`
+    outside Coda) write the depth-wise and cross-loop outlier beacon tags (`d2027, d2110, d2296, d1206`) read by
+    downstream blocks and loops.
+    """
+    slot = int(cache_slot)
+    if 0 <= slot < 6:
+        layer_idx, loop_pass = slot, -1
+    elif 6 <= slot < 18:
+        layer_idx, loop_pass = slot, 0
+    elif 18 <= slot < 24:
+        layer_idx, loop_pass = slot, -2
+    elif 24 <= slot < 36:
+        layer_idx, loop_pass = slot - 18, 1
+    elif 36 <= slot < 48:
+        layer_idx, loop_pass = slot - 30, 2
+    else:
+        layer_idx, loop_pass = slot % 24, -2
+    is_postloop = 18 <= slot < 24
+    is_loop3 = 36 <= slot < 48
+    is_beacon = (not is_postloop) and ((slot % 6) == 5)
+    return {
+        "cache_slot": slot,
+        "layer_idx": layer_idx,
+        "loop_pass": loop_pass,
+        "block_idx": layer_idx // 6,
+        "is_postloop": is_postloop,
+        "is_loop3": is_loop3,
+        "is_beacon": is_beacon,
+    }
+
+
 def resolve_decode_moe_routing(cfg: Any, cache_slot: int, T: int) -> tuple[bool, int, int, float, bool]:
     """Resolve `(dyn, k_max, k_min, ratio_thr, renorm)` for MoE visit `cache_slot` (`0..47`) at sequence length `T`.
 
     - Prefill (`T > 8`): defaults to 100% static `k=8` (`dyn=False`) unless `LAMQ_PREFILL_DYNAMIC_MOE=1` is set,
       preventing prefill throughput slowdown (`-3.8%`) and prompt KV cache drift (`KL = 0.01025`).
     - Decode (`T <= 8`): combines `cfg.moe_*` with optional `LAMQ_DECODE_MOE_K_MAX`, `LAMQ_DECODE_MOE_K_MIN`,
-      `LAMQ_DECODE_MOE_RATIO_THR`, and post-loop `L18..23` (`cache_slot >= 42`) `LAMQ_POSTLOOP_MOE_K_MAX`.
+      `LAMQ_DECODE_MOE_RATIO_THR`, `LAMQ_LOOP3_MOE_K_MAX`, and post-loop `L18..23` (`18 <= cache_slot < 24`) /
+      non-beacon Loop Pass 3 (`36 <= cache_slot < 48, (cache_slot % 6) != 5`) `LAMQ_POSTLOOP_MOE_K_MAX`.
+    - Goodfire Beacon Protection (`LAMQ_BEACON_PROTECT_MOE=1`, default ON for pass-specific `LAMQ_POSTLOOP_MOE_K_MAX` /
+      `LAMQ_LOOP3_MOE_K_MAX`): locks the block-final beacon tagging layers `L5, L11, L17` (`cache_slot in {5,11,17,29,35,41,47}`)
+      at lossless `k=8` so cross-loop (`d2027, d2110`) and depth-wise (`d2296, d1206`) routing spikes stay exact.
     """
     if T > 8 and os.environ.get("LAMQ_PREFILL_DYNAMIC_MOE", "0") != "1":
         return False, 8, 8, 0.0, False
@@ -2001,10 +2047,18 @@ def resolve_decode_moe_routing(cfg: Any, cache_slot: int, T: int) -> tuple[bool,
     env_active = False
 
     if T <= 8:
+        slot_info = classify_inkling_cache_slot(cache_slot)
+        beacon_protect = os.environ.get("LAMQ_BEACON_PROTECT_MOE", "1") != "0"
         env_kmax = os.environ.get("LAMQ_DECODE_MOE_K_MAX", "").strip()
         if env_kmax:
-            k_max = max(1, min(8, int(env_kmax)))
-            env_active = True
+            if not (beacon_protect and slot_info["is_beacon"] and os.environ.get("LAMQ_FORCE_GLOBAL_BEACON_PRUNE", "0") != "1"):
+                k_max = max(1, min(8, int(env_kmax)))
+                env_active = True
+            elif not os.environ.get("LAMQ_BEACON_PROTECT_STRICT", "0") == "1":
+                # If global LAMQ_DECODE_MOE_K_MAX is explicitly requested without strict override, allow global k_max
+                # unless this is a pass-specific postloop/loop3 rule.
+                k_max = max(1, min(8, int(env_kmax)))
+                env_active = True
         env_kmin = os.environ.get("LAMQ_DECODE_MOE_K_MIN", "").strip()
         if env_kmin:
             k_min = max(1, min(8, int(env_kmin)))
@@ -2013,13 +2067,33 @@ def resolve_decode_moe_routing(cfg: Any, cache_slot: int, T: int) -> tuple[bool,
         if env_thr:
             ratio_thr = max(0.0, float(env_thr))
             env_active = True
-        if cache_slot >= 42:
-            env_post = os.environ.get("LAMQ_POSTLOOP_MOE_K_MAX", "").strip()
-            if env_post:
-                post_k = max(1, min(8, int(env_post)))
-                k_max = min(k_max, post_k)
-                k_min = min(k_min, post_k)
-                env_active = True
+
+        # Tap-41 Coherent Beacon-Protected MoE Routing:
+        # - `LAMQ_POSTLOOP_MOE_K_MAX`: applies to pre-tap41 Loop-3 Block-3 non-beacon slots (42..46, L12..16),
+        #   while protecting Beacon L17 (slot 47) and keeping post-tap41 Coda L18..23 (slots 18..23) coherent with DSpark!
+        # - `LAMQ_CODA_MOE_K_MAX`: optional explicit override for Coda L18..23 (slots 18..23, e.g. for serial non-DSpark decode).
+        # - `LAMQ_LOOP3_MOE_K_MAX`: optional explicit override for all 10 non-beacon Loop-3 slots (36..40, 42..46).
+        env_post = os.environ.get("LAMQ_POSTLOOP_MOE_K_MAX", "").strip()
+        env_coda = os.environ.get("LAMQ_CODA_MOE_K_MAX", "").strip()
+        env_loop3 = os.environ.get("LAMQ_LOOP3_MOE_K_MAX", "").strip()
+        is_non_beacon_loop3 = slot_info["is_loop3"] and (not (beacon_protect and slot_info["is_beacon"]))
+
+        if slot_info["is_postloop"] and env_coda:
+            coda_k = max(1, min(8, int(env_coda)))
+            k_max = min(k_max, coda_k)
+            k_min = min(k_min, coda_k)
+            env_active = True
+        elif is_non_beacon_loop3 and env_loop3:
+            l3_k = max(1, min(8, int(env_loop3)))
+            k_max = min(k_max, l3_k)
+            k_min = min(k_min, l3_k)
+            env_active = True
+        elif cache_slot >= 42 and env_post and (not (beacon_protect and slot_info["is_beacon"])):
+            post_k = max(1, min(8, int(env_post)))
+            k_max = min(k_max, post_k)
+            k_min = min(k_min, post_k)
+            env_active = True
+
         if env_active and not env_kmin and ratio_thr <= 0.0:
             k_min = min(k_min, k_max)
         if env_active:
@@ -2305,6 +2379,709 @@ def set_postloop_ant_tier(
         "elapsed_ms": round(dt_ms, 1),
         "freed_mb": round(delta_mb, 1),
         "active_gb": round(mem_after / 1e9, 3),
+    }
+
+
+# --------------------------------------------------------------------------- Goodfire Mechanistic Math: Rank-2 Cross-Loop & Pre-Normalized BlockAttnRes
+
+
+@lru_cache(maxsize=4)
+def _make_prenorm_bar_kernel(with_norm: bool):
+    norm_inputs = ["q", "blocks_hat", "partial", "norm_w", "meta"] if with_norm else ["q", "blocks_hat", "partial", "meta"]
+    store_code = (
+        """
+        float ss = 0.0f;
+        #pragma unroll
+        for (uint e = 0; e < 9u; e++) ss += acc[qi][e] * acc[qi][e];
+        ss = simd_sum(ss);
+        if (lane == 0u) red[qi][simd] = ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float tot = 0.0f;
+        for (uint i = 0; i < 8u; i++) tot += red[qi][i];
+        const float ir_out = metal::precise::rsqrt(tot * (1.0f / 2304.0f) + 1e-6f);
+        device float* op = out + ((ulong)qi * T + t) * 2304u;
+        #pragma unroll
+        for (uint e = 0; e < 9u; e++) {
+            const uint ch = tid + e * 256u;
+            op[ch] = acc[qi][e] * ir_out * norm_w[ch];
+        }
+        """
+        if with_norm
+        else """
+        device float* op = out + ((ulong)qi * T + t) * 2304u;
+        #pragma unroll
+        for (uint e = 0; e < 9u; e++) op[tid + e * 256u] = acc[qi][e];
+        """
+    )
+    src = f"""
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint t = threadgroup_position_in_grid.y;
+    const uint n_blocks = meta[0], num_q = meta[1], T = meta[2];
+    const uint S = n_blocks + 1u;
+
+    threadgroup float red[4][8];
+    threadgroup float tg_ss_part[8];
+    threadgroup float tg_dp[6][4][8];
+    threadgroup float tg_w[4][6];
+
+    float qv[4][9];
+    for (uint qi = 0; qi < num_q; qi++) {{
+        const device float* qp = q + (ulong)qi * 2304u;
+        #pragma unroll
+        for (uint e = 0; e < 9u; e++) qv[qi][e] = qp[tid + e * 256u];
+    }}
+
+    // Hold all S <= 5 states in thread registers (1x DRAM read instead of 2x!)
+    // Completed blocks (s < n_blocks) are already RMS-normalized at block boundaries (inv_rms == 1.0f).
+    float sv_all[5][9];
+    for (uint s = 0; s < n_blocks; s++) {{
+        const device float* sp = blocks_hat + ((ulong)s * T + t) * 2304u;
+        #pragma unroll
+        for (uint e = 0; e < 9u; e++) sv_all[s][e] = sp[tid + e * 256u];
+        for (uint qi = 0; qi < num_q; qi++) {{
+            float dp = 0.0f;
+            #pragma unroll
+            for (uint e = 0; e < 9u; e++) dp += qv[qi][e] * sv_all[s][e];
+            dp = simd_sum(dp);
+            if (lane == 0u) tg_dp[s][qi][simd] = dp;
+        }}
+    }}
+    {{
+        const device float* sp = partial + (ulong)t * 2304u;
+        float ss = 0.0f;
+        #pragma unroll
+        for (uint e = 0; e < 9u; e++) {{
+            const float v = sp[tid + e * 256u];
+            sv_all[n_blocks][e] = v;
+            ss += v * v;
+        }}
+        ss = simd_sum(ss);
+        if (lane == 0u) tg_ss_part[simd] = ss;
+        for (uint qi = 0; qi < num_q; qi++) {{
+            float dp = 0.0f;
+            #pragma unroll
+            for (uint e = 0; e < 9u; e++) dp += qv[qi][e] * sv_all[n_blocks][e];
+            dp = simd_sum(dp);
+            if (lane == 0u) tg_dp[n_blocks][qi][simd] = dp;
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {{
+        float tot_p = 0.0f;
+        for (uint i = 0; i < 8u; i++) tot_p += tg_ss_part[i];
+        const float ir_part = metal::precise::rsqrt(tot_p * (1.0f / 2304.0f) + 1e-6f);
+        for (uint qi = 0; qi < num_q; qi++) {{
+            float sc[6];
+            float mxv = -1e30f;
+            for (uint s = 0; s < S; s++) {{
+                float dp = 0.0f;
+                for (uint i = 0; i < 8u; i++) dp += tg_dp[s][qi][i];
+                const float ir = (s < n_blocks) ? 1.0f : ir_part;
+                sc[s] = dp * ir * (1.0f / 48.0f);
+                mxv = max(mxv, sc[s]);
+            }}
+            float sum = 0.0f;
+            for (uint s = 0; s < S; s++) {{ float w = metal::precise::exp(sc[s] - mxv); tg_w[qi][s] = w; sum += w; }}
+            const float inv = 1.0f / sum;
+            for (uint s = 0; s < n_blocks; s++) tg_w[qi][s] *= inv;
+            tg_w[qi][n_blocks] *= inv * ir_part;
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc[4][9];
+    for (uint qi = 0; qi < num_q; qi++) for (uint e = 0; e < 9u; e++) acc[qi][e] = 0.0f;
+    for (uint s = 0; s < S; s++) {{
+        for (uint qi = 0; qi < num_q; qi++) {{
+            const float w = tg_w[qi][s];
+            #pragma unroll
+            for (uint e = 0; e < 9u; e++) acc[qi][e] += w * sv_all[s][e];
+        }}
+    }}
+    for (uint qi = 0; qi < num_q; qi++) {{
+        {store_code}
+    }}
+    """
+    return mx.fast.metal_kernel(
+        name=f"ink_bar_prenorm_n{int(with_norm)}",
+        input_names=norm_inputs,
+        output_names=["out"],
+        source=src,
+    )
+
+
+@lru_cache(maxsize=2)
+def _make_prenorm_bar_norm_rht_kernel():
+    src = """
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint t = threadgroup_position_in_grid.y;
+    const uint n_blocks = meta[0], T = meta[1];
+    const uint S = n_blocks + 1u;
+    const uint c0 = simd * 9u;
+
+    threadgroup float red[8];
+    threadgroup float tg_ss_part[8];
+    threadgroup float tg_dp[6][8];
+    threadgroup float tg_w[6];
+    threadgroup float tg_z[32 * 72];
+
+    float qv[9];
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) qv[j] = q[lane * 72u + c0 + j];
+
+    float sv_all[5][9];
+    for (uint s = 0; s < n_blocks; s++) {
+        const device float* sp = blocks_hat + ((ulong)s * T + t) * 2304u;
+        float dp = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < 9u; j++) {
+            const float v = sp[lane * 72u + c0 + j];
+            sv_all[s][j] = v;
+            dp += qv[j] * v;
+        }
+        dp = simd_sum(dp);
+        if (lane == 0u) tg_dp[s][simd] = dp;
+    }
+    {
+        const device float* sp = partial + (ulong)t * 2304u;
+        float ss = 0.0f, dp = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < 9u; j++) {
+            const float v = sp[lane * 72u + c0 + j];
+            sv_all[n_blocks][j] = v;
+            ss += v * v;
+            dp += qv[j] * v;
+        }
+        ss = simd_sum(ss);
+        dp = simd_sum(dp);
+        if (lane == 0u) { tg_ss_part[simd] = ss; tg_dp[n_blocks][simd] = dp; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float tot_s = 0.0f;
+        for (uint i = 0; i < 8u; i++) tot_s += tg_ss_part[i];
+        const float ir_part = metal::precise::rsqrt(tot_s * (1.0f / 2304.0f) + 1e-6f);
+        float sc[6];
+        float mxv = -1e30f;
+        for (uint s = 0; s < S; s++) {
+            float tot_d = 0.0f;
+            for (uint i = 0; i < 8u; i++) tot_d += tg_dp[s][i];
+            const float ir = (s < n_blocks) ? 1.0f : ir_part;
+            sc[s] = tot_d * ir * (1.0f / 48.0f);
+            mxv = max(mxv, sc[s]);
+        }
+        float sum = 0.0f;
+        for (uint s = 0; s < S; s++) { float w = metal::precise::exp(sc[s] - mxv); tg_w[s] = w; sum += w; }
+        const float inv = 1.0f / sum;
+        for (uint s = 0; s < n_blocks; s++) tg_w[s] *= inv;
+        tg_w[n_blocks] *= inv * ir_part;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc[9];
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) acc[j] = 0.0f;
+    for (uint s = 0; s < S; s++) {
+        const float w = tg_w[s];
+        #pragma unroll
+        for (uint j = 0; j < 9u; j++) acc[j] += w * sv_all[s][j];
+    }
+    float ss_out = 0.0f;
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) ss_out += acc[j] * acc[j];
+    ss_out = simd_sum(ss_out);
+    if (lane == 0u) red[simd] = ss_out;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot_out = 0.0f;
+    for (uint i = 0; i < 8u; i++) tot_out += red[i];
+    const float ir_out = metal::precise::rsqrt(tot_out * (1.0f / 2304.0f) + 1e-6f);
+
+    device half* hp = h_f16_out + (ulong)t * 2304u;
+    device half* rp = x_rot_out + (ulong)t * 2304u;
+    const bool h1 = lane & 1u, h2 = lane & 2u, h4 = lane & 4u, h8 = lane & 8u, h16 = lane & 16u;
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) {
+        const uint c = c0 + j;
+        const uint idx = lane * 72u + c;
+        const float hm = acc[j] * ir_out * norm_w[idx];
+        hp[idx] = (half)hm;
+        float v = hm * gu_signs[idx];
+        float o;
+        o = simd_shuffle_xor(v, 1u);  v = h1  ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 2u);  v = h2  ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 4u);  v = h4  ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 8u);  v = h8  ? (o - v) : (v + o);
+        o = simd_shuffle_xor(v, 16u); v = h16 ? (o - v) : (v + o);
+        tg_z[idx] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const threadgroup float* zr = tg_z + lane * 72u;
+    constexpr float INV_S = 1.0f / 48.0f;
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) {
+        const uint c = c0 + j;
+        const device float4* br = (const device float4*)(B + c * 72u);
+        float racc = 0.0f;
+        #pragma unroll
+        for (uint k4 = 0; k4 < 18u; k4++) {
+            const float4 b4 = br[k4];
+            const uint k = k4 * 4u;
+            racc += zr[k] * b4.x + zr[k + 1u] * b4.y + zr[k + 2u] * b4.z + zr[k + 3u] * b4.w;
+        }
+        rp[lane * 72u + c] = (half)(racc * INV_S);
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="ink_bar_prenorm_norm_rht_f16",
+        input_names=["q", "blocks_hat", "partial", "norm_w", "gu_signs", "B", "meta"],
+        output_names=["h_f16_out", "x_rot_out"],
+        source=src,
+    )
+
+
+def block_attn_res_prenorm_fused(
+    query: mx.array,
+    blocks_hat: mx.array | None,
+    n_blocks: int,
+    partial: mx.array,
+    norm_w: mx.array | None = None,
+) -> mx.array:
+    """Single-read BlockAttnRes (+ optional RMSNorm) where `blocks_hat` stores pre-normalized completed blocks."""
+    T = int(partial.size) // 2304
+    num_q = 1 if query.ndim == 1 else int(query.shape[0])
+    b_in = blocks_hat.reshape(-1) if (blocks_hat is not None and n_blocks > 0) else _fk._EMPTY_F32
+    mt = _fk._u32(n_blocks, num_q, T)
+    if norm_w is not None:
+        return _make_prenorm_bar_kernel(True)(
+            inputs=[query.reshape(-1), b_in, partial.reshape(-1), norm_w.reshape(-1), mt],
+            grid=(256, T, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(num_q, T, 2304)],
+            output_dtypes=[mx.float32],
+        )[0]
+    return _make_prenorm_bar_kernel(False)(
+        inputs=[query.reshape(-1), b_in, partial.reshape(-1), mt],
+        grid=(256, T, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(num_q, T, 2304)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def block_attn_res_prenorm_norm_rht_fast(
+    query: mx.array,
+    blocks_hat: mx.array | None,
+    n_blocks: int,
+    partial: mx.array,
+    norm_w: mx.array,
+    gu_signs: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Single-read BlockAttnRes(1) + RMSNorm + RHT-2304 where `blocks_hat` stores pre-normalized completed blocks."""
+    T = int(partial.size) // 2304
+    b_in = blocks_hat.reshape(-1) if (blocks_hat is not None and n_blocks > 0) else _fk._EMPTY_F32
+    return _make_prenorm_bar_norm_rht_kernel()(
+        inputs=[query.reshape(-1), b_in, partial.reshape(-1), norm_w.reshape(-1), gu_signs.reshape(-1), _fk._paley_b_flat(2304), _fk._u32(n_blocks, T)],
+        grid=(256, T, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(T, 2304), (T, 2304)],
+        output_dtypes=[mx.float16, mx.float16],
+    )
+
+
+@lru_cache(maxsize=2)
+def _make_rank2_blend_3x_kernel():
+    src = """
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint gt = threadgroup_position_in_grid.y; // 0 .. 3*T - 1
+    const uint T = meta[0], h_shared = meta[1], nw_shared = meta[2], col0 = meta[3];
+    const uint g = gt / T;
+    const uint t = gt - g * T;
+    const device float* hp = h + ((ulong)(h_shared ? 0u : g) * T + t) * 2304u;
+    const device float* v2p = v2_hat + (ulong)t * 2304u;
+    const device float* v3p = v3_hat + (ulong)t * 2304u;
+    const float b3 = beta3_t48[t * 48u + col0 + g];
+    const float b2 = 1.0f - b3;
+    const device bfloat16_t* fgp = fg_mg3 + (ulong)gt * 4608u;
+    const device bfloat16_t* mgp = fgp + 2304u;
+    const device float* nwp = norm_w + (ulong)(nw_shared ? 0u : g) * 2304u;
+    device float* op = out + (ulong)gt * 2304u;
+
+    float v[9];
+    float ss = 0.0f;
+    #pragma unroll
+    for (uint e = 0; e < 9u; e++) {
+        const uint ch = tid + e * 256u;
+        const float fg = metal::precise::tanh((float)fgp[ch]);
+        const float mg = metal::precise::tanh((float)mgp[ch]);
+        const float mp_ch = b2 * v2p[ch] + b3 * v3p[ch];
+        v[e] = (1.0f - fg) * hp[ch] + mg * mp_ch;
+        ss += v[e] * v[e];
+    }
+    threadgroup float red[8];
+    ss = simd_sum(ss);
+    if (lane == 0u) red[simd] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint i = 0; i < 8u; i++) tot += red[i];
+    const float ir = metal::precise::rsqrt(tot * (1.0f / 2304.0f) + 1e-6f);
+    #pragma unroll
+    for (uint e = 0; e < 9u; e++) {
+        const uint ch = tid + e * 256u;
+        op[ch] = v[e] * ir * nwp[ch];
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="ink_msg_blend_norm_3x_rank2_t48",
+        input_names=["h", "v2_hat", "v3_hat", "beta3_t48", "fg_mg3", "norm_w", "meta"],
+        output_names=["out"],
+        source=src,
+    )
+
+
+@lru_cache(maxsize=2)
+def _make_rank2_blend_rht_kernel():
+    src = """
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint t = threadgroup_position_in_grid.y;
+    const uint col = meta[0];
+    const uint c0 = simd * 9u;
+    const device float* hp = h + (ulong)t * 2304u;
+    const device float* v2p = v2_hat + (ulong)t * 2304u;
+    const device float* v3p = v3_hat + (ulong)t * 2304u;
+    const float b3 = beta3_t48[t * 48u + col];
+    const float b2 = 1.0f - b3;
+    const device bfloat16_t* fgp = fg_mg + (ulong)t * 4608u;
+    const device bfloat16_t* mgp = fgp + 2304u;
+
+    float v[9];
+    float ss = 0.0f;
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) {
+        const uint idx = lane * 72u + c0 + j;
+        const float fg = metal::precise::tanh((float)fgp[idx]);
+        const float mg = metal::precise::tanh((float)mgp[idx]);
+        const float mp_idx = b2 * v2p[idx] + b3 * v3p[idx];
+        v[j] = (1.0f - fg) * hp[idx] + mg * mp_idx;
+        ss += v[j] * v[j];
+    }
+    threadgroup float red[8];
+    threadgroup float tg_z[32 * 72];
+    ss = simd_sum(ss);
+    if (lane == 0u) red[simd] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (uint i = 0; i < 8u; i++) tot += red[i];
+    const float ir = metal::precise::rsqrt(tot * (1.0f / 2304.0f) + 1e-6f);
+
+    device half* hop = h_f16_out + (ulong)t * 2304u;
+    device half* rop = x_rot_out + (ulong)t * 2304u;
+    const bool h1 = lane & 1u, h2 = lane & 2u, h4 = lane & 4u, h8 = lane & 8u, h16 = lane & 16u;
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) {
+        const uint c = c0 + j;
+        const uint idx = lane * 72u + c;
+        const float hm = v[j] * ir * norm_w[idx];
+        hop[idx] = (half)hm;
+        float rv = hm * gu_signs[idx];
+        float o;
+        o = simd_shuffle_xor(rv, 1u);  rv = h1  ? (o - rv) : (rv + o);
+        o = simd_shuffle_xor(rv, 2u);  rv = h2  ? (o - rv) : (rv + o);
+        o = simd_shuffle_xor(rv, 4u);  rv = h4  ? (o - rv) : (rv + o);
+        o = simd_shuffle_xor(rv, 8u);  rv = h8  ? (o - rv) : (rv + o);
+        o = simd_shuffle_xor(rv, 16u); rv = h16 ? (o - rv) : (rv + o);
+        tg_z[idx] = rv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const threadgroup float* zr = tg_z + lane * 72u;
+    constexpr float INV_S = 1.0f / 48.0f;
+    #pragma unroll
+    for (uint j = 0; j < 9u; j++) {
+        const uint c = c0 + j;
+        const device float4* br = (const device float4*)(B + c * 72u);
+        float racc = 0.0f;
+        #pragma unroll
+        for (uint k4 = 0; k4 < 18u; k4++) {
+            const float4 b4 = br[k4];
+            const uint k = k4 * 4u;
+            racc += zr[k] * b4.x + zr[k + 1u] * b4.y + zr[k + 2u] * b4.z + zr[k + 3u] * b4.w;
+        }
+        rop[lane * 72u + c] = (half)(racc * INV_S);
+    }
+    """
+    return mx.fast.metal_kernel(
+        name="ink_msg_blend_norm_rht_rank2_t48_f16",
+        input_names=["h", "v2_hat", "v3_hat", "beta3_t48", "fg_mg", "norm_w", "gu_signs", "B", "meta"],
+        output_names=["h_f16_out", "x_rot_out"],
+        source=src,
+    )
+
+
+def msg_blend_norm_3x_rank2(
+    h: mx.array,
+    v2_hat_1d: mx.array,
+    v3_hat_1d: mx.array,
+    beta3_flat: mx.array,
+    fg_mg3_bf16: mx.array,
+    norm_w: mx.array,
+    T: int,
+    h_shared: bool,
+    norm_shared: bool,
+    col0: int,
+) -> mx.array:
+    """Zero-materialization 3x QKV message blend + RMSNorm directly from Rank-2 `(v2_hat, v3_hat, beta3)`."""
+    return _make_rank2_blend_3x_kernel()(
+        inputs=[h.reshape(-1), v2_hat_1d, v3_hat_1d, beta3_flat, fg_mg3_bf16.reshape(-1), norm_w.reshape(-1), _fk._u32(T, int(h_shared), int(norm_shared), int(col0))],
+        grid=(256, 3 * T, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(3, T, 2304)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def msg_blend_norm_rht_rank2(
+    h: mx.array,
+    v2_hat_1d: mx.array,
+    v3_hat_1d: mx.array,
+    beta3_flat: mx.array,
+    fg_mg_bf16: mx.array,
+    norm_w: mx.array,
+    gu_signs: mx.array,
+    col: int,
+) -> tuple[mx.array, mx.array]:
+    """Zero-materialization MLP message blend + RMSNorm + RHT-2304 directly from Rank-2 `(v2_hat, v3_hat, beta3)`."""
+    T = int(h.size) // 2304
+    return _make_rank2_blend_rht_kernel()(
+        inputs=[h.reshape(-1), v2_hat_1d, v3_hat_1d, beta3_flat, fg_mg_bf16.reshape(-1), norm_w.reshape(-1), gu_signs.reshape(-1), _fk._paley_b_flat(2304), _fk._u32(int(col))],
+        grid=(256, T, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(T, 2304), (T, 2304)],
+        output_dtypes=[mx.float16, mx.float16],
+    )
+
+
+@mx.compile
+def _precompute_loop_pass_rank2_compiled(
+    v2_hat: mx.array,
+    v3_raw: mx.array,
+    u_ordered: mx.array,
+    all_dm_ordered: mx.array,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    v3_hat = mx.fast.rms_norm(v3_raw, None, 1e-6)
+    gap = ((v3_hat - v2_hat) @ u_ordered.T) * (1.0 / 48.0)  # [T, 48]
+    beta3 = mx.sigmoid(gap)
+    beta2 = 1.0 - beta3
+
+    # Exact Law-of-Cosines identity for unit-RMS v2_hat, v3_hat (beta2 + beta3 == 1):
+    # beta2^2 + beta3^2 + 2*beta2*beta3*a23 = 1 - 2*beta2*beta3*(1 - a23)
+    a23 = mx.mean(v2_hat * v3_hat, axis=-1, keepdims=True)
+    r_s = mx.rsqrt(mx.maximum(1.0 - 2.0 * beta2 * beta3 * (1.0 - a23), 0.0) + 1e-6)
+
+    c2 = (r_s * beta2)[:, :, None].astype(mx.bfloat16)
+    c3 = (r_s * beta3)[:, :, None].astype(mx.bfloat16)
+
+    T = v2_hat.shape[0]
+    v23_bf16 = mx.stack([v2_hat.astype(mx.bfloat16), v3_hat.astype(mx.bfloat16)], axis=0)
+    Z23 = mx.matmul(v23_bf16, all_dm_ordered.T)  # [2, T, 3072]
+    Z = c2 * Z23[0].reshape(T, 48, 64) + c3 * Z23[1].reshape(T, 48, 64)
+    return v2_hat, v3_hat, beta3.reshape(-1), Z
+
+
+def precompute_loop_pass_rank2(
+    v2: mx.array,
+    v3_raw: mx.array,
+    u_ordered: mx.array,
+    all_dm_ordered: mx.array,
+    *,
+    v2_is_prenorm: bool = True,
+) -> tuple[mx.array, mx.array, mx.array, mx.array]:
+    """Exact Rank-2 Law-of-Cosines precomputation of all 48 cross-loop attention weights & gate projections for one loop pass."""
+    v2_hat = v2 if v2_is_prenorm else mx.fast.rms_norm(v2, None, 1e-6)
+    return _precompute_loop_pass_rank2_compiled(v2_hat, v3_raw, u_ordered, all_dm_ordered)
+
+
+@mx.compile
+def _msg_3x_shared_h_rank2_compiled(h: mx.array, Z: mx.array, dh3_flat: mx.array, fm3: mx.array, col0: int) -> mx.array:
+    hn = mx.fast.rms_norm(h, None, 1e-6).astype(mx.bfloat16)
+    g = ((hn @ dh3_flat.T).reshape(-1, 3, 64) + Z[:, col0 : col0 + 3, :]).swapaxes(0, 1)
+    return mx.matmul(g, fm3.swapaxes(-1, -2))
+
+
+@mx.compile
+def _msg_3x_split_h_rank2_compiled(h3: mx.array, Z: mx.array, dh3: mx.array, fm3: mx.array, col0: int) -> mx.array:
+    hn = mx.fast.rms_norm(h3, None, 1e-6).astype(mx.bfloat16)
+    g = mx.matmul(hn, dh3.swapaxes(-1, -2)) + Z[:, col0 : col0 + 3, :].swapaxes(0, 1)
+    return mx.matmul(g, fm3.swapaxes(-1, -2))
+
+
+@mx.compile
+def _msg_1x_rank2_compiled(h: mx.array, Z: mx.array, dh: mx.array, fm: mx.array, col: int) -> mx.array:
+    hn = mx.fast.rms_norm(h, None, 1e-6).astype(mx.bfloat16)
+    return (hn @ dh.T + Z[:, col, :]) @ fm.T
+
+
+def ensure_rank2_loop_tables(model: Any) -> tuple[mx.array, mx.array]:
+    """Build and cache `(u_ordered[48, 2304], all_dm_ordered[3072, 2304])` + 2D `qkv_dh3_flat` across loop layers `L6..17`."""
+    cached = getattr(model, "_rank2_loop_tables", None)
+    if cached is not None:
+        return cached
+    cfg = model.cfg
+    H = int(cfg.hidden_size)
+    num_loop = int(cfg.loop_end - cfg.loop_start)
+    q_all = model.message_in_q.astype(mx.float32)  # [12, 4, 2304]
+    u_qkv = q_all[:, :3, :].reshape(num_loop * 3, H)
+    u_mlp = q_all[:, 3, :].reshape(num_loop, H)
+    u_ordered = mx.concatenate([u_qkv, u_mlp], axis=0)
+
+    qkv_dms = []
+    mlp_dms = []
+    for i in range(cfg.loop_start, cfg.loop_end):
+        L = model.layers[i]
+        if getattr(L, "qkv_dh3_flat", None) is None:
+            L.qkv_dh3_flat = L.qkv_dh3.reshape(3 * int(cfg.loop_gate_rank), H)
+        qkv_dms.append(L.qkv_dm3.reshape(3 * int(cfg.loop_gate_rank), H))
+        mlp_dms.append(L.mlp_dm)
+    all_dm_ordered = mx.concatenate(qkv_dms + mlp_dms, axis=0)
+    mx.eval(u_ordered, all_dm_ordered)
+    model._rank2_loop_tables = (u_ordered, all_dm_ordered)
+    return u_ordered, all_dm_ordered
+
+
+def extract_beacon_importance(steering_path: str | os.PathLike) -> tuple[Any, Any]:
+    """Compute per-channel L2 importance across all 104 depth-wise & cross-loop readers in `steering.safetensors`."""
+    import numpy as np
+
+    st = mx.load(str(steering_path))
+    readers = [np.array(st["model.message_input.query"].astype(mx.float32)).reshape(-1, 2304)]
+    for l in range(24):
+        ak = f"model.layers.{l}.attention_input.query"
+        if ak in st:
+            readers.append(np.array(st[ak].astype(mx.float32)).reshape(-1, 2304))
+        mk = f"model.layers.{l}.mlp_input.query"
+        if mk in st:
+            readers.append(np.array(st[mk].astype(mx.float32)).reshape(-1, 2304))
+    if "model.final_input.query" in st:
+        readers.append(np.array(st["model.final_input.query"].astype(mx.float32)).reshape(1, 2304))
+    all_readers = np.concatenate(readers, axis=0)
+    col_norm = np.linalg.norm(all_readers, axis=0)
+    beacon_mult = (col_norm / (np.median(col_norm) + 1e-6)).astype(np.float32)
+    beacon_act = np.where(beacon_mult > 2.5, beacon_mult * 1.5, 1.0).astype(np.float32)
+    return beacon_mult, beacon_act
+
+
+def quantize_mtp_beacon_protected(
+    src_safetensors: str | os.PathLike,
+    dst_safetensors: str | os.PathLike,
+    *,
+    steering_path: str | os.PathLike | None = None,
+    group_size: int = 64,
+    bits: int = 4,
+    tap_bits: int = 8,
+    alpha: float = 0.5,
+) -> dict[str, Any]:
+    """Beacon-Aware AWQ LayerNorm Folding + Mixed-Precision (`tap_bits=8` on target-tap KV & Markov head) MTP quantizer.
+
+    Protects the DSpark drafter (`mtp.safetensors`) against Goodfire's massive cross-loop & depth-wise outlier beacons
+    (`d2027` at +32.4 RMS, `d2110, d1206, d2296, d1375, d1600`) by:
+      1. Folding exact per-channel AWQ scales `s_c` into `layers.{0,1,2}.dflare_norm.weight` (kept in FP32) <-> `(k_proj_ctx, v_proj_ctx)`,
+         `markov_head.dflare_norm.weight` (FP32) <-> `markov_head.rnn_proj.weight[:, 2816:5120]`, and
+         `layers.0.input_layernorm.weight` (using `mask_embed` prior) <-> `layers.0.self_attn.{q,k,v}_proj.weight`.
+      2. Quantizing target-tap ingest (`k_proj_ctx`, `v_proj_ctx`) and Markov recurrence bottleneck (`rnn_proj`, `hidden_out`)
+         at `tap_bits` (default 8-bit, reducing `ctx_v` RMSE by `15.0x` and Markov RMSE by `-10.9%` for only `+9.3 MB`).
+    """
+    from pathlib import Path
+    import numpy as np
+
+    src_w = mx.load(str(src_safetensors))
+    mod_w = dict(src_w)
+    H = int(mod_w["mask_embed"].shape[0]) if "mask_embed" in mod_w else 2304
+
+    if steering_path is not None and Path(steering_path).is_file():
+        _, beacon_act = extract_beacon_importance(steering_path)
+    else:
+        beacon_act = np.ones((H,), dtype=np.float32)
+        for idx, mult in ((2027, 8.0), (2110, 7.5), (1206, 9.5), (2296, 9.7), (1375, 9.6), (1600, 6.4), (924, 6.0), (2012, 6.0), (1573, 8.8), (943, 8.6)):
+            if idx < H:
+                beacon_act[idx] = mult
+
+    def _awq_scale(w_ln_np, w_mats_np, act_prior_np, exp_a: float):
+        act_est = np.abs(w_ln_np) * act_prior_np
+        w_cat = np.concatenate(w_mats_np, axis=0)
+        w_col_max = np.max(np.abs(w_cat), axis=0) + 1e-6
+        s = (act_est ** exp_a) / (w_col_max ** (1.0 - exp_a))
+        s = s.reshape(-1, group_size)
+        s = s / (np.median(s, axis=1, keepdims=True) + 1e-6)
+        return np.clip(s.reshape(-1), 0.25, 4.0).astype(np.float32)
+
+    for i in range(3):
+        p = f"layers.{i}."
+        if (p + "dflare_norm.weight") in mod_w and (p + "self_attn.k_proj_ctx.weight") in mod_w:
+            w_ln = np.array(mod_w[p + "dflare_norm.weight"].astype(mx.float32))
+            wk = np.array(mod_w[p + "self_attn.k_proj_ctx.weight"].astype(mx.float32))
+            wv = np.array(mod_w[p + "self_attn.v_proj_ctx.weight"].astype(mx.float32))
+            s_ctx = _awq_scale(w_ln, [wk, wv], beacon_act, alpha)
+            mod_w[p + "dflare_norm.weight"] = mx.array(w_ln / s_ctx, dtype=mx.float32)
+            mod_w[p + "self_attn.k_proj_ctx.weight"] = mx.array(wk * s_ctx[None, :]).astype(mx.bfloat16)
+            mod_w[p + "self_attn.v_proj_ctx.weight"] = mx.array(wv * s_ctx[None, :]).astype(mx.bfloat16)
+
+    if "markov_head.dflare_norm.weight" in mod_w and "markov_head.rnn_proj.weight" in mod_w:
+        w_hd = np.array(mod_w["markov_head.dflare_norm.weight"].astype(mx.float32))
+        wrnn = np.array(mod_w["markov_head.rnn_proj.weight"].astype(mx.float32))
+        if wrnn.shape[1] >= H:
+            col_start = wrnn.shape[1] - H
+            s_hd = _awq_scale(w_hd, [wrnn[:, col_start:]], beacon_act, alpha)
+            mod_w["markov_head.dflare_norm.weight"] = mx.array(w_hd / s_hd, dtype=mx.float32)
+            wrnn[:, col_start:] *= s_hd[None, :]
+            mod_w["markov_head.rnn_proj.weight"] = mx.array(wrnn).astype(mx.bfloat16)
+
+    tap_keys = {
+        "layers.0.self_attn.k_proj_ctx.weight",
+        "layers.0.self_attn.v_proj_ctx.weight",
+        "layers.1.self_attn.k_proj_ctx.weight",
+        "layers.1.self_attn.v_proj_ctx.weight",
+        "layers.2.self_attn.k_proj_ctx.weight",
+        "layers.2.self_attn.v_proj_ctx.weight",
+        "markov_head.rnn_proj.weight",
+        "markov_head.hidden_out.weight",
+    }
+    out: dict[str, mx.array] = {}
+    q_keys = []
+    tap_q_keys = []
+    for k, v in mod_w.items():
+        if v.ndim == 2 and v.shape[1] % group_size == 0 and v.nbytes >= 1_000_000:
+            b = int(tap_bits) if k in tap_keys else int(bits)
+            wq, sc, bi = mx.quantize(v, group_size=group_size, bits=b)
+            out[k] = wq
+            out[k + ".scales"] = sc
+            out[k + ".biases"] = bi
+            q_keys.append(k)
+            if k in tap_keys:
+                tap_q_keys.append(k)
+        else:
+            out[k] = v
+    mx.eval(out)
+    dst = Path(dst_safetensors)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    mx.save_safetensors(str(dst), out)
+    raw_mb = sum(v.nbytes for v in src_w.values()) / 1e6
+    q_mb = sum(v.nbytes for v in out.values()) / 1e6
+    return {
+        "src_mb": round(raw_mb, 2),
+        "dst_mb": round(q_mb, 2),
+        "compression": round(raw_mb / max(q_mb, 1e-6), 2),
+        "quantized_matrices": len(q_keys),
+        "tap_protected_matrices": len(tap_q_keys),
+        "bits": int(bits),
+        "tap_bits": int(tap_bits),
+        "group_size": int(group_size),
     }
 
 
@@ -2698,13 +3475,215 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         _gen_mod.stream_dspark = _ngram_stream_dspark
         _inkling_mod.stream_dspark = _ngram_stream_dspark
 
-    # 2e. Low-memory prefill guard for large quant variants (e.g. 12.8GB on 24 GB Unified Memory):
-    #     When active Metal memory exceeds 12 GiB during a T >= 64 prefill chunk, skip holding all 12
-    #     loop layers' dequantized FP16 QKV & O matrices simultaneously (+645 MB) and flush async_eval
-    #     every 2 visits instead of 4 (-400 MB peak graph activations), cutting peak prefill RAM by >1 GB
-    #     with bit-for-bit identical output (max_diff == 0.0).
-    orig_forward_core_fast = _model_mod.Inkling2LoopPackedMLX._forward_core_fast
+    # 2d-bis. Auto-detect per-matrix bits (2, 4, 8) in DSpark _QLinear.__init__ for mixed-precision Beacon-Protected MTP
+    if hasattr(_drafter_mod, "_QLinear"):
+        orig_qlin_init = _drafter_mod._QLinear.__init__
+
+        def _auto_bits_qlin_init(self, weights, key: str = "", bits: int = 4, group_size: int = 64):
+            if weights is not None and (key + ".scales") in weights:
+                w_t = weights[key]
+                sc_t = weights[key + ".scales"]
+                if hasattr(w_t, "shape") and hasattr(sc_t, "shape") and len(w_t.shape) == 2 and len(sc_t.shape) == 2 and int(sc_t.shape[1]) > 0:
+                    inferred = (int(w_t.shape[1]) * 32) // (int(sc_t.shape[1]) * int(group_size))
+                    if inferred in (2, 4, 8):
+                        bits = inferred
+            return orig_qlin_init(self, weights, key=key, bits=bits, group_size=group_size)
+
+        _drafter_mod._QLinear.__init__ = _auto_bits_qlin_init
+
+    # 2e. Goodfire Mechanistic Forward Path:
+    #     - Opt #1 (LAMQ_RANK2_LOOP_MSG=1): Exact Rank-2 Cross-Loop Message Factorization & Law-of-Cosines RMSNorm
+    #       (collapses 48 message RMSNorms + 48 `dm` GEMMs into 2 vectors `[v2_hat, v3_hat]` and eliminates `[12, 4, T, 2304]` materialization).
+    #     - Opt #2 (LAMQ_PRENORM_BAR=1): Pre-normalized single-read BlockAttnRes + deduplicated block-boundary concatenation
+    #       (stores `v_hat = rms_norm(v)` once per block boundary, eliminating 8 duplicate concats and 50% DRAM reads across 96 BAR calls).
+    #     - Plus low-memory prefill guard for T >= 64 chunks on 24 GB Unified Memory.
     _low_mem_thresh = int(float(os.environ.get("LAMQ_LOW_MEM_THRESHOLD_GB", "12.5")) * (1 << 30))
+
+    def _fast_layer_forward(
+        self,
+        h: mx.array,
+        blocks_cat: mx.array | None,
+        n_blocks: int,
+        q_pos0: int,
+        T: int,
+        cache,
+        cache_slot: int,
+        messages: mx.array | None = None,
+        tree_spec: dict | None = None,
+        qkv_w_cached: mx.array | None = None,
+        o_w_cached: mx.array | None = None,
+        *,
+        blocks_prenorm: bool = False,
+        precomputed_local_blocks: mx.array | None = None,
+        rank2_ctx: tuple[mx.array, mx.array, mx.array, mx.array, int] | None = None,
+    ) -> mx.array:
+        cfg = self.cfg
+        block_residual = h
+        tree_lag = tree_spec["lag_mx"] if tree_spec is not None else None
+        tree_depth = tree_spec["depth_mx"] if tree_spec is not None else None
+        tree_mask = tree_spec["mask_mx"] if tree_spec is not None else None
+        bar_fn = block_attn_res_prenorm_fused if blocks_prenorm else _model_mod.block_attn_res_fused
+        bar_rht_fn = block_attn_res_prenorm_norm_rht_fast if blocks_prenorm else _model_mod.block_attn_res_norm_rht_fast
+
+        # 1. Attn input AttnRes + optional Rank-2 / batched message gates + layernorm + 5-matrix batched RHT-2304
+        use_qkv_sg8 = (4 <= T <= 8) if _model_mod._is_m4() else (5 <= T <= 8)
+        if self.is_sliding:
+            if messages is None and rank2_ctx is None:
+                if self.attn_in_q is not None:
+                    q_in = bar_fn(self.attn_in_q, blocks_cat, n_blocks, h, norm_w=self.in_ln)[0]
+                else:
+                    q_in = _model_mod.rms_norm(h, self.in_ln, cfg.rms_norm_eps)
+                x_rot5 = _model_mod.rht_in_2304_fast(q_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=False, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+            elif rank2_ctx is not None:
+                v2_1d, v3_1d, b3_flat, Z, loop_layer_idx = rank2_ctx
+                col0 = loop_layer_idx * 3
+                h_a = bar_fn(self.attn_in_q, blocks_cat, n_blocks, h)[0]
+                dh3_flat = getattr(self, "qkv_dh3_flat", None)
+                if dh3_flat is None:
+                    dh3_flat = self.qkv_dh3_flat = self.qkv_dh3.reshape(192, cfg.hidden_size)
+                fg_mg3 = _msg_3x_shared_h_rank2_compiled(h_a, Z, dh3_flat, self.qkv_fm3, col0)
+                qkv_in = msg_blend_norm_3x_rank2(h_a, v2_1d, v3_1d, b3_flat, fg_mg3, self.in_ln, T, h_shared=True, norm_shared=True, col0=col0)
+                q_in = qkv_in[0]
+                x_rot5 = _model_mod.rht_in_2304_fast(qkv_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=True, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+            else:
+                h_a = bar_fn(self.attn_in_q, blocks_cat, n_blocks, h)[0]
+                fg_mg3 = _model_mod._msg_3x_shared_h_compiled(h_a, messages[:3], self.qkv_dh3, self.qkv_dm3, self.qkv_fm3)
+                qkv_in = _model_mod.msg_blend_norm_3x_fused(h_a, messages[:3], fg_mg3, self.in_ln, T, h_shared=True, norm_shared=True)
+                q_in = qkv_in[0]
+                x_rot5 = _model_mod.rht_in_2304_fast(qkv_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=True, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+        else:
+            if self.attn_in_q is None:
+                qkv_h = mx.broadcast_to(h[None, :, :], (3, T, 2304))
+            else:
+                qkv_h = bar_fn(self.attn_in_q, blocks_cat, n_blocks, h)
+            if rank2_ctx is not None:
+                v2_1d, v3_1d, b3_flat, Z, loop_layer_idx = rank2_ctx
+                col0 = loop_layer_idx * 3
+                fg_mg3 = _msg_3x_split_h_rank2_compiled(qkv_h, Z, self.qkv_dh3, self.qkv_fm3, col0)
+                qkv_in = msg_blend_norm_3x_rank2(qkv_h, v2_1d, v3_1d, b3_flat, fg_mg3, self.qkv_in_ln, T, h_shared=False, norm_shared=False, col0=col0)
+                q_in, k_in, v_in = qkv_in[0], qkv_in[1], qkv_in[2]
+            elif messages is not None:
+                fg_mg3 = _model_mod._msg_3x_split_h_compiled(qkv_h, messages[:3], self.qkv_dh3, self.qkv_dm3, self.qkv_fm3)
+                qkv_in = _model_mod.msg_blend_norm_3x_fused(qkv_h, messages[:3], fg_mg3, self.qkv_in_ln, T, h_shared=False, norm_shared=False)
+                q_in, k_in, v_in = qkv_in[0], qkv_in[1], qkv_in[2]
+            else:
+                q_in = _model_mod.rms_norm(qkv_h[0], self.q_in_ln, cfg.rms_norm_eps)
+                k_in = _model_mod.rms_norm(qkv_h[1], self.k_in_ln, cfg.rms_norm_eps)
+                v_in = _model_mod.rms_norm(qkv_h[2], self.v_in_ln, cfg.rms_norm_eps)
+                qkv_in = mx.stack([q_in, k_in, v_in], axis=0)
+            x_rot5 = _model_mod.rht_in_2304_fast(qkv_in, self.qkv_stage.signs_in, n_signs=5, T=T, split_qkv=True, out_dtype=mx.float16, transpose_for_sg8=use_qkv_sg8)
+
+        # 2. Fused 5-matrix QKV + Rel + O_Gate stage
+        use_split_parts = (T > 8) and not (self.is_sliding and not self.has_qkv_out_rot)
+        if use_split_parts:
+            q_raw, k_raw, v_raw, rel_raw, o_gate_raw = self.qkv_stage.matmul_rotated_f16_parts(x_rot5, T, W_cached=qkv_w_cached)
+            y_qkv = None
+        else:
+            y_qkv = (
+                (
+                    self.qkv_stage.matmul_rotated_sg8_f16(x_rot5, T=T)
+                    if _model_mod._is_m4()
+                    else self.qkv_stage.matmul_rotated_sg8_f16(x_rot5, T=T, rb=1, sg=8, ntg=160)
+                )
+                if use_qkv_sg8
+                else self.qkv_stage.matmul_rotated_f16(x_rot5, T, W_cached=qkv_w_cached)
+            )
+            o_gate_raw = y_qkv[:, 5504:8576]
+        if self.qkv_out_rots[4] is not None:
+            o_gate_raw = _model_mod.rht_apply_out(o_gate_raw, self.qkv_out_rots[4])
+
+        # 3. Fused Q/Rel clip (+log_scale) + K/V conv/norm + unified FP16 KV append
+        kp = cache.get_conv_prev(cache_slot, 0, 1024)
+        vp = cache.get_conv_prev(cache_slot, 1, 1024)
+        if self.is_sliding and not self.has_qkv_out_rot:
+            q, rel_st, kv_f16, new_kp, new_vp = _model_mod.qkv_rel_prep_sliding_fused(
+                y_qkv, self.q_scale, self.rel_scale,
+                kp, self.k_conv_w, vp, self.v_conv_w,
+                T, cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
+                tree_lag=tree_lag,
+            )
+            cache.set_conv_after(cache_slot, 0, kp, y_qkv[:, 3072:4096].reshape(1, T, 1024), new_kp)
+            cache.set_conv_after(cache_slot, 1, vp, y_qkv[:, 4096:5120].reshape(1, T, 1024), new_vp)
+        else:
+            if not use_split_parts:
+                q_raw = y_qkv[:, 0:3072]
+                k_raw = y_qkv[:, 3072:4096]
+                v_raw = y_qkv[:, 4096:5120]
+                rel_raw = y_qkv[:, 5120:5504]
+            if self.qkv_out_rots[0] is not None:
+                q_raw = _model_mod.rht_apply_out(q_raw, self.qkv_out_rots[0])
+            if self.qkv_out_rots[1] is not None:
+                k_raw = _model_mod.rht_out_1024_fast(k_raw, self.qkv_out_rots[1]) if k_raw.shape[-1] == 1024 else _model_mod.rht_apply_out(k_raw, self.qkv_out_rots[1])
+            if self.qkv_out_rots[2] is not None:
+                v_raw = _model_mod.rht_out_1024_fast(v_raw, self.qkv_out_rots[2]) if v_raw.shape[-1] == 1024 else _model_mod.rht_apply_out(v_raw, self.qkv_out_rots[2])
+            if self.qkv_out_rots[3] is not None:
+                rel_raw = _model_mod.rht_apply_out(rel_raw, self.qkv_out_rots[3])
+            q, rel_st = _model_mod.q_rel_clip_fused(
+                q_raw, self.q_scale, rel_raw, self.rel_scale,
+                q_pos0, T, self.is_sliding,
+                cfg.qk_l2_clip_threshold, cfg.rel_l2_clip_threshold,
+                cfg.log_scaling_alpha, cfg.log_scaling_n_floor,
+                tree_depth=tree_depth,
+            )
+            if self.is_sliding:
+                kv_f16, new_kp, new_vp = _model_mod.kv_sconv4_norm_fused(kp, k_raw, self.k_conv_w, vp, v_raw, self.v_conv_w, T, cfg.qk_l2_clip_threshold, tree_lag=tree_lag)
+            else:
+                kv_f16, new_kp, new_vp = _model_mod.kv_dyn_sconv4_norm_fused(
+                    kp, k_raw, k_in, self.k_dyn_st, self.k_dyn_pr_f16,
+                    vp, v_raw, v_in, self.v_dyn_st, self.v_dyn_pr_f16,
+                    T, cfg.qk_l2_clip_threshold, tree_lag=tree_lag,
+                )
+            cache.set_conv_after(cache_slot, 0, kp, k_raw.reshape(1, T, 1024), new_kp)
+            cache.set_conv_after(cache_slot, 1, vp, v_raw.reshape(1, T, 1024), new_vp)
+
+        KV_buf, kv_len, kv_start, kv_cap, kv_is_fp8, kv_q4_sc = cache.update_kv_f16(cache_slot, kv_f16, self.is_sliding)
+
+        # 4. Fused Sinks + GQA+RelPos Flash-Decoding / FlashAttention-2 SDPA
+        attn_out = _model_mod.gqa_relpos_sinks_sdpa_fast(
+            q, KV_buf, rel_st, self.rel_proj_t_f16, q_in, self.sink_w_f16,
+            T, kv_len, kv_start, q_pos0, kv_cap, self.is_sliding,
+            tree_depth=tree_depth, tree_mask=tree_mask, kv_fp8=kv_is_fp8, kv_q4_scales=kv_q4_sc,
+        )
+
+        # 5. Fused Gate*Attn + RHT-3072 -> O projection -> Post-Attn ShortConv4 (+ Residual)
+        o_rot = _model_mod.rht_in_3072_gated_fast(attn_out, o_gate_raw, self.o_stage.signs_in, out_dtype=mx.float16)
+        o_out = self.o_stage.matmul_rotated_f16(o_rot, T, W_cached=o_w_cached)
+        if self.o_out_rot is not None:
+            o_out = _model_mod.rht_apply_out(o_out, self.o_out_rot)
+        pa_prev = cache.get_conv_prev(cache_slot, 2, 2304)
+        if self.is_block_boundary:
+            h_post, new_pa = _model_mod.short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=None, tree_lag=tree_lag)
+            residual = h_post
+            if precomputed_local_blocks is not None:
+                local_blocks = precomputed_local_blocks
+            else:
+                b_new = mx.fast.rms_norm(block_residual, None, 1e-6) if blocks_prenorm else block_residual
+                local_blocks = b_new[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, b_new[None, :, :]], axis=0)
+            n_local = n_blocks + 1
+        else:
+            h_post, new_pa = _model_mod.short_conv4_res_fused(pa_prev, o_out, self.post_attn_conv_w, T, 2304, residual=block_residual, tree_lag=tree_lag)
+            residual = h_post
+            local_blocks = blocks_cat
+            n_local = n_blocks
+        cache.set_conv_after(cache_slot, 2, pa_prev, o_out.reshape(1, T, 2304), new_pa)
+
+        # 6+7. Fused MLP input AttnRes / MsgBlend + Norm + RHT-2304(gu_signs) -> Unified MoE + post-MLP conv + residual!
+        if messages is None and rank2_ctx is None:
+            h_mlp_f16, x_rot_gu = bar_rht_fn(self.mlp_in_q, local_blocks, n_local, h_post, self.post_attn_ln, self.moe.gu_signs_in)
+        elif rank2_ctx is not None:
+            v2_1d, v3_1d, b3_flat, Z, loop_layer_idx = rank2_ctx
+            col_mlp = 36 + loop_layer_idx
+            h_m = bar_fn(self.mlp_in_q, local_blocks, n_local, h_post)[0]
+            fg_mg = _msg_1x_rank2_compiled(h_m, Z, self.mlp_dh, self.mlp_fm, col_mlp)
+            h_mlp_f16, x_rot_gu = msg_blend_norm_rht_rank2(h_m, v2_1d, v3_1d, b3_flat, fg_mg, self.post_attn_ln, self.moe.gu_signs_in, col=col_mlp)
+        else:
+            h_m = bar_fn(self.mlp_in_q, local_blocks, n_local, h_post)[0]
+            fg_mg = _model_mod._msg_1x_compiled(h_m, messages[3], self.mlp_dh, self.mlp_dm, self.mlp_fm)
+            h_mlp_f16, x_rot_gu = _model_mod.msg_blend_norm_rht_fast(h_m, messages[3], fg_mg, self.post_attn_ln, self.moe.gu_signs_in)
+
+        return self.moe.forward_fast_fused_prerot(h_mlp_f16, x_rot_gu, residual, self.post_mlp_conv_w, cache, cache_slot, T, tree_lag=tree_lag)
+
+    _model_mod.PackedDecoderLayer.forward_fast = _fast_layer_forward
 
     def _adaptive_forward_core_fast(
         self,
@@ -2739,21 +3718,6 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
                 ):
                     set_postloop_ant_tier(self, "high", log_fn=log_fn)
 
-        n_tok = len(input_ids) if isinstance(input_ids, (list, tuple)) else int(input_ids.shape[-1])
-        force_low = os.environ.get("LAMQ_LOW_MEM_PREFILL") == "1"
-        is_short_bypass = 64 <= n_tok < 512 and getattr(cache, "seq_len", 0) == 0 and int(getattr(cache, "_reserve_cap", 0) or 0) == 0
-        if n_tok < 64 or (not force_low and not is_short_bypass and mx.get_active_memory() <= _low_mem_thresh):
-            return orig_forward_core_fast(
-                self,
-                input_ids,
-                cache,
-                all_logits=all_logits,
-                argmax_only=argmax_only,
-                ordered_only=ordered_only,
-                tap_visits=tap_visits,
-                tree_spec=tree_spec,
-                skip_logits=skip_logits,
-            )
         cfg = self.cfg
         h = self.embed(input_ids)[0]  # [T, 2304]
         T = int(h.shape[0])
@@ -2764,13 +3728,33 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         captured: dict[int, mx.array] = {}
         visit = 0
 
+        use_prenorm = os.environ.get("LAMQ_PRENORM_BAR", "1") != "0"
+        use_rank2 = os.environ.get("LAMQ_RANK2_LOOP_MSG", "1") != "0"
+        bar_fn = block_attn_res_prenorm_fused if use_prenorm else _model_mod.block_attn_res_fused
+
+        force_low = os.environ.get("LAMQ_LOW_MEM_PREFILL") == "1"
+        is_short_bypass = 64 <= T < 512 and getattr(cache, "seq_len", 0) == 0 and int(getattr(cache, "_reserve_cap", 0) or 0) == 0
+        low_mem_prefill = force_low or is_short_bypass or (T >= 64 and mx.get_active_memory() > _low_mem_thresh)
+        cache_loop_w = (T >= 64) and (cfg.loop_passes > 1) and (not low_mem_prefill)
+        loop_w_cache: dict[int, tuple[mx.array, mx.array]] = {}
+
+        # 1. Pre-loop layers (L0..5)
         for i in range(cfg.loop_start):
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
-            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
             if L.is_block_boundary:
-                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                b_new = mx.fast.rms_norm(h, None, 1e-6) if use_prenorm else h
+                next_blocks = b_new[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, b_new[None, :, :]], axis=0)
+            else:
+                next_blocks = None
+            new_h = L.forward_fast(
+                h, blocks_cat, n_blocks, q_pos0, T, cache, i,
+                messages=None, tree_spec=tree_spec,
+                blocks_prenorm=use_prenorm, precomputed_local_blocks=next_blocks,
+            )
+            if L.is_block_boundary:
+                blocks_cat = next_blocks
                 n_blocks += 1
             h = new_h
             visit += 1
@@ -2781,23 +3765,38 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
         pre_loop_blocks = blocks_cat
         num_pre = n_blocks
 
+        # 2. Pass 0 over loop layers (L6..17)
         for i in range(cfg.loop_start, cfg.loop_end):
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
+            if cache_loop_w:
+                wq_c = L.qkv_stage.dequant_f16()
+                wo_c = L.o_stage.dequant_f16()
+                loop_w_cache[i] = (wq_c, wo_c)
+            else:
+                wq_c = wo_c = None
+            if L.is_block_boundary:
+                b_new = mx.fast.rms_norm(h, None, 1e-6) if use_prenorm else h
+                next_blocks = b_new[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, b_new[None, :, :]], axis=0)
+            else:
+                next_blocks = None
             new_h = L.forward_fast(
                 h, blocks_cat, n_blocks, q_pos0, T, cache, i,
-                messages=None, tree_spec=tree_spec, qkv_w_cached=None, o_w_cached=None,
+                messages=None, tree_spec=tree_spec, qkv_w_cached=wq_c, o_w_cached=wo_c,
+                blocks_prenorm=use_prenorm, precomputed_local_blocks=next_blocks,
             )
             if L.is_block_boundary:
-                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                blocks_cat = next_blocks
                 n_blocks += 1
             h = new_h
             visit += 1
             if (visit & 3) == 0:
                 mx.async_eval(h)
 
+        # 3. Passes 1..loop_passes-1 over loop layers with Rank-2 cross-pass message factorization
         num_loop = cfg.loop_end - cfg.loop_start
+        u_ordered, all_dm_ordered = ensure_rank2_loop_tables(self) if use_rank2 else (None, None)
         for loop_idx in range(1, cfg.loop_passes):
             prev_n = n_blocks - (num_pre + 1)
             prev_blocks = blocks_cat[num_pre + 1 :] if prev_n > 0 else None
@@ -2806,39 +3805,78 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
             blocks_cat = pre_loop_blocks
             n_blocks = num_pre
             cache_offset = cfg.num_hidden_layers + (loop_idx - 1) * num_loop - cfg.loop_start
+
+            if use_rank2 and prev_n == 1 and prev_blocks is not None:
+                v2_hat, v3_hat, b3_flat, Z_rank2 = precompute_loop_pass_rank2(
+                    prev_blocks[0], prev_h, u_ordered, all_dm_ordered, v2_is_prenorm=use_prenorm
+                )
+                v2_1d, v3_1d = v2_hat.reshape(-1), v3_hat.reshape(-1)
+                use_pass_rank2 = True
+            else:
+                v2_1d = v3_1d = b3_flat = Z_rank2 = None
+                use_pass_rank2 = False
+
             for loop_layer_idx, i in enumerate(range(cfg.loop_start, cfg.loop_end)):
                 if visit in tap_set:
                     captured[visit] = h
                 L = self.layers[i]
-                msgs = _model_mod.block_attn_res_fused(self.message_in_q[loop_layer_idx], prev_blocks, prev_n, prev_h)
-                new_h = L.forward_fast(
-                    h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset,
-                    messages=msgs, tree_spec=tree_spec, qkv_w_cached=None, o_w_cached=None,
-                )
+                wq_c, wo_c = loop_w_cache[i] if cache_loop_w else (None, None)
                 if L.is_block_boundary:
-                    blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                    b_new = mx.fast.rms_norm(h, None, 1e-6) if use_prenorm else h
+                    next_blocks = b_new[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, b_new[None, :, :]], axis=0)
+                else:
+                    next_blocks = None
+                if use_pass_rank2:
+                    new_h = L.forward_fast(
+                        h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset,
+                        messages=None, tree_spec=tree_spec, qkv_w_cached=wq_c, o_w_cached=wo_c,
+                        blocks_prenorm=use_prenorm, precomputed_local_blocks=next_blocks,
+                        rank2_ctx=(v2_1d, v3_1d, b3_flat, Z_rank2, loop_layer_idx),
+                    )
+                else:
+                    msgs = bar_fn(self.message_in_q[loop_layer_idx], prev_blocks, prev_n, prev_h)
+                    new_h = L.forward_fast(
+                        h, blocks_cat, n_blocks, q_pos0, T, cache, i + cache_offset,
+                        messages=msgs, tree_spec=tree_spec, qkv_w_cached=wq_c, o_w_cached=wo_c,
+                        blocks_prenorm=use_prenorm, precomputed_local_blocks=next_blocks,
+                    )
+                if L.is_block_boundary:
+                    blocks_cat = next_blocks
                     n_blocks += 1
                 h = new_h
                 visit += 1
                 if (visit & 3) == 0:
                     mx.async_eval(h)
+        if cache_loop_w:
+            loop_w_cache.clear()
 
+        # 4. Post-loop layers (L18..23)
         for i in range(cfg.loop_end, cfg.num_hidden_layers):
             if visit in tap_set:
                 captured[visit] = h
             L = self.layers[i]
-            new_h = L.forward_fast(h, blocks_cat, n_blocks, q_pos0, T, cache, i, messages=None, tree_spec=tree_spec)
             if L.is_block_boundary:
-                blocks_cat = h[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, h[None, :, :]], axis=0)
+                b_new = mx.fast.rms_norm(h, None, 1e-6) if use_prenorm else h
+                next_blocks = b_new[None, :, :] if n_blocks == 0 else mx.concatenate([blocks_cat, b_new[None, :, :]], axis=0)
+            else:
+                next_blocks = None
+            new_h = L.forward_fast(
+                h, blocks_cat, n_blocks, q_pos0, T, cache, i,
+                messages=None, tree_spec=tree_spec,
+                blocks_prenorm=use_prenorm, precomputed_local_blocks=next_blocks,
+            )
+            if L.is_block_boundary:
+                blocks_cat = next_blocks
                 n_blocks += 1
             h = new_h
             visit += 1
             if (visit & 3) == 0 and visit < 48:
                 mx.async_eval(h)
 
+        # 5. Final AttnRes + norm + unpadded lm_head
         if skip_logits:
             if visit in tap_set:
-                h = _model_mod.block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]
+                h = bar_fn(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]
                 captured[visit] = h
             cache.seq_len += T
             if tap_visits:
@@ -2847,9 +3885,9 @@ def install_metal_accelerations(log_fn=None) -> dict[str, Any]:
             return h, cache
         if not all_logits and visit not in tap_set and T > 1:
             b_last = blocks_cat[:, -1:, :] if (blocks_cat is not None and n_blocks > 0) else blocks_cat
-            h_in = _model_mod.block_attn_res_fused(self.final_in_q, b_last, n_blocks, h[-1:, :], norm_w=self.final_norm_w)[0][None, :, :]
+            h_in = bar_fn(self.final_in_q, b_last, n_blocks, h[-1:, :], norm_w=self.final_norm_w)[0][None, :, :]
         else:
-            h = _model_mod.block_attn_res_fused(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]
+            h = bar_fn(self.final_in_q, blocks_cat, n_blocks, h, norm_w=self.final_norm_w)[0]
             if visit in tap_set:
                 captured[visit] = h
             h_in = h[None, :, :] if all_logits else h[-1:, :][None, :, :]
