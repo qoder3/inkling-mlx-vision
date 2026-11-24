@@ -52,8 +52,10 @@ class FairQueue:
 def make_queued_handler_factory(orig_make_handler, log_fn: Callable[[str], None]):
     """Return a `make_handler` replacement that queues concurrent requests instead of returning HTTP 503."""
 
-    def _queued_make_handler(engine, model_id: str, *, api_key: str | None = None, loopback: bool = True):
-        BaseHandler = orig_make_handler(engine, model_id, api_key=api_key, loopback=loopback)
+    def _queued_make_handler(engine, model_id: str, *, api_key: str | None = None, loopback: bool = True, **extra):
+        # `extra` forwards upstream flags (e.g. `ui` added in newer runtime_mlx)
+        # so version skew between this wrapper and the engine cannot crash serve().
+        BaseHandler = orig_make_handler(engine, model_id, api_key=api_key, loopback=loopback, **extra)
         fifo = FairQueue()
         prep_lock = threading.Lock()
 
