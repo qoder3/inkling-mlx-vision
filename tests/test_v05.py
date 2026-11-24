@@ -821,4 +821,108 @@ def test_v055_select_adaptive_draft_block_4tier_and_long_context():
     assert spec.select_adaptive_draft_block(4.20, ctx_len=65536, max_block=8) == 6
 
 
+def test_v056_repack_moe_arrays_hot_cold_bijection_and_monotonic_locs():
+    rng = np.random.default_rng(20260506)
+    n_exp = 8
+    # Interleaved format IDs: gu_fids in {2, 7}, dn_fids in {6, 7}
+    gu_fids = np.array([2, 7, 2, 7, 2, 2, 7, 7], dtype=np.int16)
+    gu_locs = np.array([0, 0, 1, 1, 2, 3, 2, 3], dtype=np.int16)
+    dn_fids = np.array([6, 7, 7, 6, 6, 7, 7, 6], dtype=np.int16)
+    dn_locs = np.array([0, 0, 1, 1, 2, 2, 3, 3], dtype=np.int16)
+
+    arrays = {
+        "gu_map": np.stack([gu_fids, gu_locs], axis=1),
+        "dn_map": np.stack([dn_fids, dn_locs], axis=1),
+        "gu_ht3_codes": np.arange(4 * 16, dtype=np.uint32).reshape(4, 4, 4),
+        "gu_ht3_scales": np.arange(4 * 4, dtype=np.float16).reshape(4, 4),
+        "gu_nvfp4_codes": np.arange(4 * 16, dtype=np.uint8).reshape(4, 4, 4),
+        "gu_nvfp4_scales": np.arange(4 * 8, dtype=np.uint8).reshape(4, 4, 2),
+        "gu_nvfp4_outer": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
+        "dn_rtr4_codes": np.arange(4 * 16, dtype=np.uint32).reshape(4, 4, 4) + 100,
+        "dn_rtr4_scales": np.arange(4 * 4, dtype=np.float16).reshape(4, 4) + 10,
+        "dn_nvfp4_codes": np.arange(4 * 16, dtype=np.uint8).reshape(4, 4, 4) + 50,
+        "dn_nvfp4_scales": np.arange(4 * 8, dtype=np.uint8).reshape(4, 4, 2) + 5,
+        "dn_nvfp4_outer": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+    }
+    rw_np = rng.standard_normal((n_exp, 16)).astype(np.float32)
+    rb_np = np.array([-0.1, 0.5, -0.3, 0.2, 0.4, -0.2, 0.8, 0.1], dtype=np.float32)
+    rw = mx.array(rw_np)
+    rb = mx.array(rb_np)
+
+    out_arr, new_rw, new_rb, perm = accel.repack_moe_arrays_hot_cold(
+        arrays, rw, rb, id_to_fmt={2: "ht3", 6: "rtr4"}
+    )
+    mx.eval(new_rw, new_rb)
+
+    # 1. Permutation is a valid bijection of 0..7
+    assert sorted(perm.tolist()) == list(range(n_exp))
+    # 2. Primary sort key: dn_fid is non-decreasing, and within equal dn_fid, gu_fid is non-decreasing
+    new_dn_map = out_arr["dn_map"]
+    new_gu_map = out_arr["gu_map"]
+    pairs = list(zip(new_dn_map[:, 0].tolist(), new_gu_map[:, 0].tolist()))
+    assert pairs == sorted(pairs)
+    # 3. Within every format fid, physical slab locations `loc` are strictly monotonic 0, 1, ..., count-1
+    for side_map in (new_gu_map, new_dn_map):
+        for fid in np.unique(side_map[:, 0]):
+            locs = side_map[side_map[:, 0] == fid, 1].tolist()
+            assert locs == list(range(len(locs)))
+    # 4. Every permuted expert index `new_e` points to the exact same physical weight tensor as `old_e = perm[new_e]`
+    for new_e, old_e in enumerate(perm.tolist()):
+        assert np.allclose(np.asarray(new_rw[new_e]), rw_np[old_e])
+        assert np.isclose(float(new_rb[new_e].item()), float(rb_np[old_e]))
+        g_fid, g_new_loc = int(new_gu_map[new_e, 0]), int(new_gu_map[new_e, 1])
+        g_old_loc = int(gu_locs[old_e])
+        if g_fid == 7:
+            assert np.array_equal(out_arr["gu_nvfp4_codes"][g_new_loc], arrays["gu_nvfp4_codes"][g_old_loc])
+            assert float(out_arr["gu_nvfp4_outer"][g_new_loc]) == float(arrays["gu_nvfp4_outer"][g_old_loc])
+        else:
+            assert np.array_equal(out_arr["gu_ht3_codes"][g_new_loc], arrays["gu_ht3_codes"][g_old_loc])
+
+
+def test_v056_set_postloop_ant_tier_hot_swap(tmp_path):
+    from pathlib import Path
+
+    hi = tmp_path / "Inkling-2-Mini-LookAtMyQuant-12.8GB"
+    lo = tmp_path / "Inkling-2-Mini-LookAtMyQuant-8.9GB"
+    hi.mkdir()
+    lo.mkdir()
+    (hi / "config.json").write_text('{"hidden_size": 2304}', encoding="utf-8")
+    (lo / "config.json").write_text('{"hidden_size": 2304}', encoding="utf-8")
+    np.savez(hi / "luts.npz", nvfp4=np.ones((4,), dtype=np.float32))
+    np.savez(lo / "luts.npz", rtr1=np.zeros((2,), dtype=np.float32))
+
+    class _FakeLayer:
+        def __init__(self, idx, cfg, packed_dir, luts, fast_luts, st):
+            self.idx = idx
+            self.source = Path(packed_dir).name
+
+    class _FakeModel:
+        def __init__(self):
+            self.packed_dir = hi
+            self.cfg = None
+            self.luts = {"nvfp4": mx.ones((4,), dtype=mx.float32)}
+            self.fast_luts = None
+            self._fast = False
+            self.st = {}
+            self.layers = [_FakeLayer(i, None, hi, self.luts, None, {}) for i in range(24)]
+
+    m = _FakeModel()
+    assert accel.find_companion_low_tier_dir(hi) == lo
+
+    # Switch L18..23 to low tier (8.9GB)
+    res_low = accel.set_postloop_ant_tier(m, "low", layers=(18, 19, 20, 21, 22, 23))
+    assert res_low["changed"] is True
+    assert res_low["tier"] == "low"
+    assert "rtr1" in m.luts
+    assert all(m.layers[i].source == hi.name for i in range(18))
+    assert all(m.layers[i].source == lo.name for i in range(18, 24))
+
+    # Switch L18..23 back to high tier (12.8GB)
+    res_hi = accel.set_postloop_ant_tier(m, "high", layers=(18, 19, 20, 21, 22, 23))
+    assert res_hi["changed"] is True
+    assert res_hi["tier"] == "high"
+    assert all(m.layers[i].source == hi.name for i in range(24))
+
+
+
 
